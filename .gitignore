@@ -1,0 +1,10 @@
+# Build and delivery artifacts created outside the application source folder
+outputs/
+work/
+
+# Repository-local editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,261 @@
+from __future__ import annotations
+
+import os
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+import sys
+import shutil
+import threading
+import traceback
+import uuid
+from pathlib import Path
+from typing import Any
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import onnxruntime as ort
+import torch
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse
+from vendor_midas.midas_net_custom import MidasNet_small
+
+
+# In a PyInstaller build, mutable data belongs beside the executable. Bundled
+# HTML assets remain in PyInstaller's internal asset directory.
+ASSET_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+STORAGE_DIR = BASE_DIR
+DATA_DIR = STORAGE_DIR / "data"
+UPLOAD_DIR = DATA_DIR / "uploads"
+RESULT_DIR = DATA_DIR / "results"
+MODEL_DIR = STORAGE_DIR / "models"
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+for directory in (UPLOAD_DIR, RESULT_DIR, MODEL_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
+
+# Keep all downloaded model files beside the project.
+
+MODES = {
+    "depth": "灰度深度图",
+    "pose": "人体姿态骨架叠加",
+    "depth_pose": "深度图 + 人体姿态骨架",
+    "face": "面部 478 点网格",
+    "all": "深度图 + 人体姿态 + 面部网格",
+}
+
+jobs: dict[str, dict[str, Any]] = {}
+models_lock = threading.Lock()
+processing_lock = threading.Lock()
+
+
+class VideoAnalyzer:
+    """Lazily loads the depth and landmark models exactly once per process."""
+
+    def __init__(self) -> None:
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.depth_model: Any | None = None
+        self.depth_ort: Any | None = None
+        self.mp_pose = mp.solutions.pose
+        self.mp_face = mp.solutions.face_mesh
+        self.drawer = mp.solutions.drawing_utils
+        self.styles = mp.solutions.drawing_styles
+
+    @property
+    def device_name(self) -> str:
+        if self.depth_ort is not None and "CUDAExecutionProvider" in self.depth_ort.get_providers():
+            return "NVIDIA CUDA (ONNX Runtime)"
+        if self.device.type == "cuda":
+            return f"NVIDIA GPU: {torch.cuda.get_device_name(0)}"
+        return "CPU"
+
+    def load_depth_model(self) -> None:
+        if self.depth_model is not None:
+            return
+        # MiDaS Small is an official monocular-depth model. The single required
+        # weight is downloaded into the project directory on first use.
+        with models_lock:
+            if self.depth_model is not None:
+                return
+            weights = MODEL_DIR / "midas_v21_small_256.pt"
+            if not weights.exists():
+                from urllib.request import urlretrieve
+
+                urlretrieve("https://github.com/isl-org/MiDaS/releases/download/v2_1/midas_v21_small_256.pt", weights)
+            self.depth_model = MidasNet_small(path=str(weights))
+            self.depth_model.to(self.device).eval()
+            if "CUDAExecutionProvider" in ort.get_available_providers():
+                onnx_path = MODEL_DIR / "midas_v21_small_256.onnx"
+                if not onnx_path.exists():
+                    sample = torch.zeros((1, 3, 256, 256), dtype=torch.float32)
+                    torch.onnx.export(self.depth_model.cpu(), sample, str(onnx_path), input_names=["image"], output_names=["depth"], opset_version=17, dynamo=False)
+                self.depth_ort = ort.InferenceSession(str(onnx_path), providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+
+    def depth_frame(self, rgb: np.ndarray) -> np.ndarray:
+        self.load_depth_model()
+        assert self.depth_model is not None
+        resized = cv2.resize(rgb, (256, 256), interpolation=cv2.INTER_CUBIC).astype(np.float32) / 255.0
+        batch_array = np.ascontiguousarray(((resized - 0.5) / 0.5).transpose(2, 0, 1)[None])
+        if self.depth_ort is not None:
+            prediction = self.depth_ort.run(None, {"image": batch_array})[0][0]
+            prediction = cv2.resize(prediction, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_CUBIC)
+            values = prediction
+        else:
+            with torch.inference_mode():
+                batch = torch.from_numpy(batch_array).to(self.device)
+                prediction = self.depth_model(batch)
+                prediction = torch.nn.functional.interpolate(
+                    prediction.unsqueeze(1), size=rgb.shape[:2], mode="bicubic", align_corners=False
+                ).squeeze()
+                values = prediction.detach().float().cpu().numpy()
+        # Normalize each frame for readable relative depth. Brighter = nearer.
+        normalized = cv2.normalize(values, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        return cv2.cvtColor(normalized, cv2.COLOR_GRAY2BGR)
+
+    def render(self, input_path: Path, output_path: Path, mode: str, progress: dict[str, Any]) -> None:
+        include_depth = mode in {"depth", "depth_pose", "all"}
+        include_pose = mode in {"pose", "depth_pose", "all"}
+        include_face = mode in {"face", "all"}
+        if include_depth:
+            self.load_depth_model()
+
+        capture = cv2.VideoCapture(str(input_path))
+        if not capture.isOpened():
+            raise ValueError("无法读取该视频。请上传常见的 MP4、MOV、AVI 或 WebM 视频。")
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        if not fps or fps < 1 or fps > 240:
+            fps = 30.0
+        width, height = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if width < 2 or height < 2:
+            raise ValueError("视频尺寸无效。")
+        frame_count = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+        writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not writer.isOpened():
+            capture.release()
+            raise RuntimeError("无法创建 MP4 输出文件。")
+
+        pose_context = self.mp_pose.Pose(
+            static_image_mode=False, model_complexity=1, enable_segmentation=False,
+            min_detection_confidence=0.5, min_tracking_confidence=0.5,
+        ) if include_pose else None
+        face_context = self.mp_face.FaceMesh(
+            static_image_mode=False, max_num_faces=1, refine_landmarks=True,
+            min_detection_confidence=0.5, min_tracking_confidence=0.5,
+        ) if include_face else None
+        try:
+            index = 0
+            while True:
+                ok, bgr = capture.read()
+                if not ok:
+                    break
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                canvas = self.depth_frame(rgb) if include_depth else bgr.copy()
+                if pose_context is not None:
+                    pose_result = pose_context.process(rgb)
+                    if pose_result.pose_landmarks:
+                        self.drawer.draw_landmarks(
+                            canvas, pose_result.pose_landmarks, self.mp_pose.POSE_CONNECTIONS,
+                            landmark_drawing_spec=self.styles.get_default_pose_landmarks_style(),
+                        )
+                if face_context is not None:
+                    face_result = face_context.process(rgb)
+                    if face_result.multi_face_landmarks:
+                        for landmarks in face_result.multi_face_landmarks:
+                            self.drawer.draw_landmarks(
+                                canvas, landmarks, self.mp_face.FACEMESH_TESSELATION,
+                                landmark_drawing_spec=None,
+                                connection_drawing_spec=self.styles.get_default_face_mesh_tesselation_style(),
+                            )
+                            self.drawer.draw_landmarks(
+                                canvas, landmarks, self.mp_face.FACEMESH_CONTOURS,
+                                landmark_drawing_spec=None,
+                                connection_drawing_spec=self.styles.get_default_face_mesh_contours_style(),
+                            )
+                writer.write(canvas)
+                index += 1
+                progress["progress"] = round(index / frame_count * 100, 1)
+                progress["message"] = f"正在处理第 {index}/{frame_count} 帧"
+        finally:
+            capture.release()
+            writer.release()
+            if pose_context:
+                pose_context.close()
+            if face_context:
+                face_context.close()
+
+
+analyzer = VideoAnalyzer()
+app = FastAPI(title="视频深度分析工具")
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> str:
+    return (ASSET_DIR / "static" / "index.html").read_text(encoding="utf-8")
+
+
+@app.get("/api/health")
+def health() -> dict[str, str]:
+    return {"status": "ok", "device": analyzer.device_name}
+
+
+@app.post("/api/jobs")
+async def create_job(background_tasks: BackgroundTasks, mode: str = Form(...), video: UploadFile = File(...)) -> dict[str, str]:
+    if mode not in MODES:
+        raise HTTPException(400, "未知的处理模式")
+    suffix = Path(video.filename or "video.mp4").suffix.lower()
+    if suffix not in {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}:
+        raise HTTPException(400, "请上传 MP4、MOV、AVI、MKV、WebM 或 M4V 视频")
+    job_id = uuid.uuid4().hex
+    input_path = UPLOAD_DIR / f"{job_id}{suffix}"
+    size = 0
+    try:
+        with input_path.open("wb") as destination:
+            while chunk := await video.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, "视频超过 500 MB 限制")
+                destination.write(chunk)
+    except Exception:
+        input_path.unlink(missing_ok=True)
+        raise
+    finally:
+        await video.close()
+    output_path = RESULT_DIR / f"{job_id}.mp4"
+    jobs[job_id] = {"status": "queued", "progress": 0, "message": "已排队", "mode": mode, "output": str(output_path)}
+    background_tasks.add_task(process_job, job_id, input_path, output_path, mode)
+    return {"job_id": job_id}
+
+
+def process_job(job_id: str, input_path: Path, output_path: Path, mode: str) -> None:
+    job = jobs[job_id]
+    try:
+        with processing_lock:
+            job.update(status="processing", message="正在加载分析模型…")
+            analyzer.render(input_path, output_path, mode, job)
+        job.update(status="completed", progress=100, message="处理完成，可以预览和下载。")
+    except Exception as exc:
+        traceback.print_exc()
+        job.update(status="failed", message=f"处理失败：{exc}")
+    finally:
+        input_path.unlink(missing_ok=True)
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str) -> dict[str, Any]:
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "任务不存在或服务已重启")
+    response = {key: value for key, value in job.items() if key != "output"}
+    if job["status"] == "completed":
+        response["download_url"] = f"/api/jobs/{job_id}/download"
+    return response
+
+
+@app.get("/api/jobs/{job_id}/download")
+def download_job(job_id: str) -> FileResponse:
+    job = jobs.get(job_id)
+    if not job or job["status"] != "completed":
+        raise HTTPException(404, "处理结果不存在")
+    path = Path(job["output"])
+    if not path.exists():
+        raise HTTPException(404, "处理结果文件丢失")
+    return FileResponse(path, media_type="video/mp4", filename=f"deep-analysis-{job_id[:8]}.mp4")
