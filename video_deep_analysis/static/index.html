@@ -1,14 +1,59 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>视频深度分析工具</title><style>
-*{box-sizing:border-box}body{margin:0;background:#0b1020;color:#ecf1ff;font:16px system-ui,"Microsoft YaHei",sans-serif}.wrap{max-width:860px;margin:0 auto;padding:48px 24px}h1{margin:0;font-size:32px}p{color:#adb9d6;line-height:1.6}.card{margin-top:25px;background:#151d33;border:1px solid #293656;border-radius:16px;padding:24px}.drop{display:block;width:100%;border:2px dashed #526da6;border-radius:12px;text-align:center;padding:30px;cursor:pointer;color:#c8d6f7}.drop:hover{background:#1c2947}input[type=file]{display:none}select,button{width:100%;border-radius:9px;padding:12px;margin-top:16px;font:inherit}select{background:#0e1629;color:#fff;border:1px solid #526da6}button{background:#607df5;color:#fff;border:0;font-weight:700;cursor:pointer}button:disabled{opacity:.55;cursor:not-allowed}#status{min-height:32px;margin-top:20px}.bar{height:10px;border-radius:8px;overflow:hidden;background:#0e1629;margin-top:9px}.bar i{display:block;background:#65d9a7;height:100%;width:0%;transition:width .3s}video{width:100%;max-height:480px;margin-top:18px;border-radius:10px;background:#000}.download{display:none;text-align:center;background:#65d9a7;color:#082415;text-decoration:none;padding:12px;margin-top:12px;border-radius:9px;font-weight:700}.note{font-size:13px}</style></head>
-<body><main class="wrap"><h1>视频深度分析工具</h1><p>上传短视频，生成带深度、人体姿态或 478 点面部网格的 MP4 成果。</p><section class="card"><label class="drop" for="video"><span id="fileText">点击选择视频，或将视频拖到这里</span><br><small>MP4 / MOV / AVI / MKV / WebM，最大 500 MB</small></label><input id="video" type="file" accept="video/*">
-<select id="mode"><option value="depth">1. 灰度深度图</option><option value="pose">2. 人体姿态骨架叠加</option><option value="depth_pose">3. 深度图 + 人体姿态骨架</option><option value="face">4. 面部 478 点网格</option><option value="all">5. 深度图 + 人体姿态 + 面部网格全部叠加</option></select><button id="go">开始分析</button><div id="status">正在检测服务…</div><div class="bar"><i id="fill"></i></div><video id="result" controls style="display:none"></video><a id="download" class="download" download>下载处理后的 MP4</a><p class="note" id="device"></p></section></main>
-<script>
-const file=document.querySelector('#video'),drop=document.querySelector('.drop'),go=document.querySelector('#go'),status=document.querySelector('#status'),fill=document.querySelector('#fill'),result=document.querySelector('#result'),download=document.querySelector('#download');
-fetch('/api/health').then(r=>r.json()).then(x=>document.querySelector('#device').textContent='推理设备：'+x.device).catch(()=>status.textContent='服务连接失败，请确认已运行 start.bat。');
-file.onchange=()=>document.querySelector('#fileText').textContent=file.files[0]?file.files[0].name:'点击选择视频，或将视频拖到这里'; ['dragenter','dragover'].forEach(e=>drop.addEventListener(e,x=>{x.preventDefault();drop.style.background='#1c2947'}));['dragleave','drop'].forEach(e=>drop.addEventListener(e,x=>{x.preventDefault();drop.style.background=''}));drop.addEventListener('drop',e=>{file.files=e.dataTransfer.files;file.dispatchEvent(new Event('change'))});
-go.onclick=async()=>{if(!file.files[0]){status.textContent='请先选择一个视频。';return}go.disabled=true;result.style.display='none';download.style.display='none';fill.style.width='0%';status.textContent='正在上传…';let form=new FormData();form.append('video',file.files[0]);form.append('mode',document.querySelector('#mode').value);try{let r=await fetch('/api/jobs',{method:'POST',body:form});let d=await r.json();if(!r.ok)throw Error(d.detail||'上传失败');poll(d.job_id)}catch(e){status.textContent=e.message;go.disabled=false}};
-download.addEventListener('click',async e=>{if(window.pywebview&&window.pywebview.api){e.preventDefault();status.textContent='正在保存 MP4…';try{let path=await window.pywebview.api.download(download.getAttribute('href'));status.textContent='已保存到：'+path}catch(err){status.textContent='保存失败：'+err}}});
-function poll(id){let timer=setInterval(async()=>{try{let r=await fetch('/api/jobs/'+id),d=await r.json();if(!r.ok)throw Error(d.detail);status.textContent=d.message;fill.style.width=(d.progress||0)+'%';if(d.status==='completed'){clearInterval(timer);result.src=d.download_url;result.style.display='block';download.href=d.download_url;download.style.display='block';go.disabled=false}else if(d.status==='failed'){clearInterval(timer);go.disabled=false}}catch(e){clearInterval(timer);status.textContent=e.message;go.disabled=false}},800)}
-</script></body></html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>视频深度分析工具</title>
+  <style>
+    *{box-sizing:border-box} body{margin:0;background:#0b1020;color:#ecf1ff;font:16px system-ui,"Microsoft YaHei",sans-serif}
+    .wrap{max-width:860px;margin:0 auto;padding:48px 24px} h1{margin:0;font-size:32px} p{color:#adb9d6;line-height:1.6}
+    .card{margin-top:25px;background:#151d33;border:1px solid #293656;border-radius:16px;padding:24px}
+    .source-title{margin:0 0 10px;color:#dce6ff;font-size:15px;font-weight:700}.drop{display:block;width:100%;border:2px dashed #526da6;border-radius:12px;text-align:center;padding:25px;cursor:pointer;color:#c8d6f7}.drop:hover{background:#1c2947}
+    input[type=file]{display:none}.or{display:flex;align-items:center;gap:12px;color:#8795b6;font-size:13px;margin:15px 0}.or::before,.or::after{content:"";height:1px;background:#293656;flex:1}
+    .url-input,select,button{width:100%;border-radius:9px;padding:12px;font:inherit}.url-input,select{background:#0e1629;color:#fff;border:1px solid #526da6}.url-input:focus,select:focus{outline:2px solid #607df5;outline-offset:1px}
+    .url-tip{margin:8px 0 0;color:#8795b6;font-size:12px}.url-tip strong{color:#aebdff} select,button{margin-top:16px} button{background:#607df5;color:#fff;border:0;font-weight:700;cursor:pointer}button:disabled{opacity:.55;cursor:not-allowed}
+    #status{min-height:32px;margin-top:20px}.bar{height:10px;border-radius:8px;overflow:hidden;background:#0e1629;margin-top:9px}.bar i{display:block;background:#65d9a7;height:100%;width:0%;transition:width .3s}
+    video{width:100%;max-height:480px;margin-top:18px;border-radius:10px;background:#000}.download{display:none;text-align:center;background:#65d9a7;color:#082415;text-decoration:none;padding:12px;margin-top:12px;border-radius:9px;font-weight:700}.note{font-size:13px}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <h1>视频深度分析工具</h1>
+    <p>上传短视频，或粘贴公开视频链接自动下载，再生成带深度、人体姿态或 478 点面部网格的 MP4 成果。</p>
+    <section class="card">
+      <p class="source-title">方式一：上传本地视频</p>
+      <label class="drop" for="video"><span id="fileText">点击选择视频，或将视频拖到这里</span><br><small>MP4 / MOV / AVI / MKV / WebM，最大 500 MB</small></label>
+      <input id="video" type="file" accept="video/*">
+      <div class="or">或</div>
+      <p class="source-title">方式二：输入视频链接</p>
+      <input id="sourceUrl" class="url-input" type="url" inputmode="url" placeholder="粘贴 http:// 或 https:// 视频页面 / 视频文件链接">
+      <p class="url-tip">链接会在本机下载后再分析。仅支持你有权下载的公开视频；播放列表不会被下载。</p>
+      <select id="mode">
+        <option value="depth">1. 灰度深度图</option><option value="pose">2. 人体姿态骨架叠加</option><option value="depth_pose">3. 深度图 + 人体姿态骨架</option><option value="face">4. 面部 478 点网格</option><option value="all">5. 深度图 + 人体姿态 + 面部网格全部叠加</option>
+      </select>
+      <button id="go">开始分析</button>
+      <div id="status">正在检测服务…</div><div class="bar"><i id="fill"></i></div>
+      <video id="result" controls style="display:none"></video><a id="download" class="download" download>下载处理后的 MP4</a><p class="note" id="device"></p>
+    </section>
+  </main>
+  <script>
+    const file=document.querySelector('#video'),drop=document.querySelector('.drop'),sourceUrl=document.querySelector('#sourceUrl'),go=document.querySelector('#go'),status=document.querySelector('#status'),fill=document.querySelector('#fill'),result=document.querySelector('#result'),download=document.querySelector('#download'),mode=document.querySelector('#mode');
+    fetch('/api/health').then(r=>r.json()).then(x=>document.querySelector('#device').textContent='推理设备：'+x.device).catch(()=>status.textContent='服务连接失败，请确认已运行 start.bat。');
+    file.onchange=()=>{document.querySelector('#fileText').textContent=file.files[0]?file.files[0].name:'点击选择视频，或将视频拖到这里';if(file.files[0])sourceUrl.value=''};
+    sourceUrl.addEventListener('input',()=>{if(sourceUrl.value.trim())file.value=''});
+    ['dragenter','dragover'].forEach(e=>drop.addEventListener(e,x=>{x.preventDefault();drop.style.background='#1c2947'}));
+    ['dragleave','drop'].forEach(e=>drop.addEventListener(e,x=>{x.preventDefault();drop.style.background=''}));
+    drop.addEventListener('drop',e=>{file.files=e.dataTransfer.files;file.dispatchEvent(new Event('change'))});
+    go.onclick=async()=>{
+      const url=sourceUrl.value.trim(),selected=file.files[0];
+      if(!selected&&!url){status.textContent='请先上传一个视频，或输入视频链接。';return}
+      go.disabled=true;result.style.display='none';download.style.display='none';fill.style.width='0%';
+      const form=new FormData();form.append('mode',mode.value);let endpoint='/api/jobs';
+      if(url){form.append('source_url',url);endpoint='/api/jobs/from-url';status.textContent='正在创建下载任务…'}else{form.append('video',selected);status.textContent='正在上传…'}
+      try{const r=await fetch(endpoint,{method:'POST',body:form});const d=await r.json();if(!r.ok)throw Error(d.detail||'任务创建失败');poll(d.job_id)}catch(e){status.textContent=e.message;go.disabled=false}
+    };
+    download.addEventListener('click',async e=>{if(window.pywebview&&window.pywebview.api){e.preventDefault();status.textContent='正在保存 MP4…';try{const path=await window.pywebview.api.download(download.getAttribute('href'));status.textContent='已保存到：'+path}catch(err){status.textContent='保存失败：'+err}}});
+    function poll(id){const timer=setInterval(async()=>{try{const r=await fetch('/api/jobs/'+id),d=await r.json();if(!r.ok)throw Error(d.detail);status.textContent=d.message;fill.style.width=(d.progress||0)+'%';if(d.status==='completed'){clearInterval(timer);result.src=d.download_url;result.style.display='block';download.href=d.download_url;download.style.display='block';go.disabled=false}else if(d.status==='failed'){clearInterval(timer);go.disabled=false}}catch(e){clearInterval(timer);status.textContent=e.message;go.disabled=false}},800)}
+  </script>
+</body>
+</html>

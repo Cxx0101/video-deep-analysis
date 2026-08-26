@@ -9,6 +9,7 @@ import traceback
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import cv2
 import mediapipe as mp
@@ -28,9 +29,10 @@ STORAGE_DIR = BASE_DIR
 DATA_DIR = STORAGE_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 RESULT_DIR = DATA_DIR / "results"
+URL_DOWNLOAD_DIR = DATA_DIR / "url_downloads"
 MODEL_DIR = STORAGE_DIR / "models"
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
-for directory in (UPLOAD_DIR, RESULT_DIR, MODEL_DIR):
+for directory in (UPLOAD_DIR, RESULT_DIR, URL_DOWNLOAD_DIR, MODEL_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 # Keep all downloaded model files beside the project.
@@ -42,6 +44,7 @@ MODES = {
     "face": "面部 478 点网格",
     "all": "深度图 + 人体姿态 + 面部网格",
 }
+VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".flv"}
 
 jobs: dict[str, dict[str, Any]] = {}
 models_lock = threading.Lock()
@@ -202,7 +205,7 @@ async def create_job(background_tasks: BackgroundTasks, mode: str = Form(...), v
     if mode not in MODES:
         raise HTTPException(400, "未知的处理模式")
     suffix = Path(video.filename or "video.mp4").suffix.lower()
-    if suffix not in {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}:
+    if suffix not in VIDEO_SUFFIXES:
         raise HTTPException(400, "请上传 MP4、MOV、AVI、MKV、WebM 或 M4V 视频")
     job_id = uuid.uuid4().hex
     input_path = UPLOAD_DIR / f"{job_id}{suffix}"
@@ -225,6 +228,79 @@ async def create_job(background_tasks: BackgroundTasks, mode: str = Form(...), v
     return {"job_id": job_id}
 
 
+def validate_video_url(source_url: str) -> str:
+    parsed = urlparse(source_url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("请输入完整的 http 或 https 视频链接。")
+    return source_url.strip()
+
+
+def download_video_from_url(source_url: str, job_id: str, job: dict[str, Any]) -> tuple[Path, Path]:
+    """Download a single public video in a private job directory with yt-dlp."""
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise RuntimeError("缺少 yt-dlp 依赖，请重新运行 setup.ps1 安装依赖。") from exc
+
+    download_dir = URL_DOWNLOAD_DIR / job_id
+    download_dir.mkdir(parents=True, exist_ok=False)
+    job.update(status="downloading", progress=0, message="正在从视频链接下载…")
+    options = {
+        "format": "bv*+ba/b",
+        "merge_output_format": "mp4",
+        "outtmpl": str(download_dir / "source.%(ext)s"),
+        "noplaylist": True,
+        "max_filesize": MAX_UPLOAD_BYTES,
+        "retries": 3,
+        "fragment_retries": 3,
+        "continuedl": True,
+        "overwrites": False,
+        "restrictfilenames": True,
+        "quiet": True,
+        "noprogress": True,
+        "no_warnings": True,
+    }
+    with yt_dlp.YoutubeDL(options) as downloader:
+        downloader.extract_info(source_url, download=True)
+
+    candidates = [
+        path for path in download_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES and path.stat().st_size > 0
+    ]
+    if not candidates:
+        raise RuntimeError("链接下载完成，但没有得到可处理的视频文件。")
+    input_path = max(candidates, key=lambda path: path.stat().st_mtime)
+    if input_path.stat().st_size > MAX_UPLOAD_BYTES:
+        raise RuntimeError("下载的视频超过 500 MB 限制。")
+    return input_path, download_dir
+
+
+@app.post("/api/jobs/from-url")
+async def create_job_from_url(
+    background_tasks: BackgroundTasks,
+    mode: str = Form(...),
+    source_url: str = Form(...),
+) -> dict[str, str]:
+    if mode not in MODES:
+        raise HTTPException(400, "未知的处理模式")
+    try:
+        source_url = validate_video_url(source_url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    job_id = uuid.uuid4().hex
+    output_path = RESULT_DIR / f"{job_id}.mp4"
+    jobs[job_id] = {
+        "status": "queued",
+        "progress": 0,
+        "message": "下载任务已排队",
+        "mode": mode,
+        "source_url": source_url,
+        "output": str(output_path),
+    }
+    background_tasks.add_task(process_url_job, job_id, source_url, output_path, mode)
+    return {"job_id": job_id}
+
+
 def process_job(job_id: str, input_path: Path, output_path: Path, mode: str) -> None:
     job = jobs[job_id]
     try:
@@ -237,6 +313,23 @@ def process_job(job_id: str, input_path: Path, output_path: Path, mode: str) -> 
         job.update(status="failed", message=f"处理失败：{exc}")
     finally:
         input_path.unlink(missing_ok=True)
+
+
+def process_url_job(job_id: str, source_url: str, output_path: Path, mode: str) -> None:
+    job = jobs[job_id]
+    download_dir: Path | None = None
+    try:
+        input_path, download_dir = download_video_from_url(source_url, job_id, job)
+        with processing_lock:
+            job.update(status="processing", message="下载完成，正在加载分析模型…")
+            analyzer.render(input_path, output_path, mode, job)
+        job.update(status="completed", progress=100, message="处理完成，可以预览和下载。")
+    except Exception as exc:
+        traceback.print_exc()
+        job.update(status="failed", message=f"处理失败：{exc}")
+    finally:
+        if download_dir is not None:
+            shutil.rmtree(download_dir, ignore_errors=True)
 
 
 @app.get("/api/jobs/{job_id}")
