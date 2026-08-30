@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-import sys
 import shutil
+import subprocess
 import threading
 import traceback
 import uuid
@@ -21,10 +22,8 @@ from fastapi.responses import FileResponse, HTMLResponse
 from vendor_midas.midas_net_custom import MidasNet_small
 
 
-# In a PyInstaller build, mutable data belongs beside the executable. Bundled
-# HTML assets remain in PyInstaller's internal asset directory.
-ASSET_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+# The web service keeps all mutable files inside the project directory.
+BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR
 DATA_DIR = STORAGE_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -49,6 +48,69 @@ VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".flv"}
 jobs: dict[str, dict[str, Any]] = {}
 models_lock = threading.Lock()
 processing_lock = threading.Lock()
+
+
+def ffmpeg_executable() -> str:
+    """Use a system FFmpeg when present, otherwise imageio-ffmpeg's binary."""
+    system_binary = shutil.which("ffmpeg")
+    if system_binary:
+        return system_binary
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        raise RuntimeError("未找到 FFmpeg，无法生成网页兼容的 H.264 MP4。请重新安装项目依赖。") from exc
+
+
+def source_rotation_degrees(video_path: Path) -> int:
+    """Return a video's display rotation without relying on OpenCV alone."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return 0
+    command = [
+        ffprobe, "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream_tags=rotate:stream_side_data=rotation",
+        "-of", "json", str(video_path),
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        stream = json.loads(completed.stdout).get("streams", [{}])[0]
+        side_data = stream.get("side_data_list", [])
+        raw_rotation = next((item.get("rotation") for item in side_data if "rotation" in item), None)
+        if raw_rotation is None:
+            raw_rotation = stream.get("tags", {}).get("rotate")
+        return int(round(float(raw_rotation))) % 360 if raw_rotation is not None else 0
+    except (IndexError, TypeError, ValueError, json.JSONDecodeError, OSError):
+        return 0
+
+
+def encode_browser_mp4(silent_video: Path, source_video: Path, output_path: Path) -> None:
+    """Encode H.264/AAC MP4, preserve source audio, and move metadata up front."""
+    command = [
+        ffmpeg_executable(), "-y",
+        "-i", str(silent_video),
+        "-i", str(source_video),
+        "-map", "0:v:0",
+        "-map", "1:a?",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        "-map_metadata", "-1",
+        "-metadata:s:v:0", "rotate=0",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if completed.returncode != 0:
+        detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "未知 FFmpeg 错误"
+        raise RuntimeError(f"MP4 转码失败：{detail}")
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError("MP4 转码未生成有效输出文件。")
 
 
 class VideoAnalyzer:
@@ -124,14 +186,25 @@ class VideoAnalyzer:
         capture = cv2.VideoCapture(str(input_path))
         if not capture.isOpened():
             raise ValueError("无法读取该视频。请上传常见的 MP4、MOV、AVI 或 WebM 视频。")
+        orientation_auto = getattr(cv2, "CAP_PROP_ORIENTATION_AUTO", None)
+        if orientation_auto is not None:
+            capture.set(orientation_auto, 0)
+        rotation = source_rotation_degrees(input_path)
+        if not rotation:
+            orientation_meta = getattr(cv2, "CAP_PROP_ORIENTATION_META", None)
+            if orientation_meta is not None:
+                rotation = int(round(capture.get(orientation_meta))) % 360
         fps = capture.get(cv2.CAP_PROP_FPS)
         if not fps or fps < 1 or fps > 240:
             fps = 30.0
         width, height = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if rotation in {90, 270}:
+            width, height = height, width
         if width < 2 or height < 2:
             raise ValueError("视频尺寸无效。")
         frame_count = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
-        writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        silent_output = output_path.with_name(f"{output_path.stem}.silent.mp4")
+        writer = cv2.VideoWriter(str(silent_output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
         if not writer.isOpened():
             capture.release()
             raise RuntimeError("无法创建 MP4 输出文件。")
@@ -150,6 +223,12 @@ class VideoAnalyzer:
                 ok, bgr = capture.read()
                 if not ok:
                     break
+                if rotation == 90:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                elif rotation == 180:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_180)
+                elif rotation == 270:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 canvas = self.depth_frame(rgb) if include_depth else bgr.copy()
                 if pose_context is not None:
@@ -184,6 +263,11 @@ class VideoAnalyzer:
                 pose_context.close()
             if face_context:
                 face_context.close()
+        try:
+            progress.update(progress=98, message="正在保留原始音频并转码为网页兼容 MP4…")
+            encode_browser_mp4(silent_output, input_path, output_path)
+        finally:
+            silent_output.unlink(missing_ok=True)
 
 
 analyzer = VideoAnalyzer()
@@ -192,7 +276,7 @@ app = FastAPI(title="视频深度分析工具")
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
-    return (ASSET_DIR / "static" / "index.html").read_text(encoding="utf-8")
+    return (BASE_DIR / "static" / "index.html").read_text(encoding="utf-8")
 
 
 @app.get("/api/health")
@@ -240,7 +324,7 @@ def download_video_from_url(source_url: str, job_id: str, job: dict[str, Any]) -
     try:
         import yt_dlp
     except ImportError as exc:
-        raise RuntimeError("缺少 yt-dlp 依赖，请重新运行 setup.ps1 安装依赖。") from exc
+        raise RuntimeError("缺少 yt-dlp 依赖，请重新安装项目依赖。") from exc
 
     download_dir = URL_DOWNLOAD_DIR / job_id
     download_dir.mkdir(parents=True, exist_ok=False)

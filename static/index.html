@@ -33,12 +33,12 @@
       </select>
       <button id="go">开始分析</button>
       <div id="status">正在检测服务…</div><div class="bar"><i id="fill"></i></div>
-      <video id="result" controls style="display:none"></video><a id="download" class="download" download>下载处理后的 MP4</a><p class="note" id="device"></p>
+      <video id="result" controls style="display:none"></video><a id="download" class="download" download>下载处理后的 MP4</a><p class="note">输出将自动校正视频旋转方向、保留原视频音频，并生成网页可播放的 MP4。</p><p class="note" id="device"></p>
     </section>
   </main>
   <script>
     const file=document.querySelector('#video'),drop=document.querySelector('.drop'),sourceUrl=document.querySelector('#sourceUrl'),go=document.querySelector('#go'),status=document.querySelector('#status'),fill=document.querySelector('#fill'),result=document.querySelector('#result'),download=document.querySelector('#download'),mode=document.querySelector('#mode');
-    fetch('/api/health').then(r=>r.json()).then(x=>document.querySelector('#device').textContent='推理设备：'+x.device).catch(()=>status.textContent='服务连接失败，请确认已运行 start.bat。');
+    fetch('/api/health').then(r=>r.json()).then(x=>document.querySelector('#device').textContent='推理设备：'+x.device).catch(()=>status.textContent='服务连接失败，请确认已运行 run_web.py。');
     file.onchange=()=>{document.querySelector('#fileText').textContent=file.files[0]?file.files[0].name:'点击选择视频，或将视频拖到这里';if(file.files[0])sourceUrl.value=''};
     sourceUrl.addEventListener('input',()=>{if(sourceUrl.value.trim())file.value=''});
     ['dragenter','dragover'].forEach(e=>drop.addEventListener(e,x=>{x.preventDefault();drop.style.background='#1c2947'}));
@@ -52,7 +52,6 @@
       if(url){form.append('source_url',url);endpoint='/api/jobs/from-url';status.textContent='正在创建下载任务…'}else{form.append('video',selected);status.textContent='正在上传…'}
       try{const r=await fetch(endpoint,{method:'POST',body:form});const d=await r.json();if(!r.ok)throw Error(d.detail||'任务创建失败');poll(d.job_id)}catch(e){status.textContent=e.message;go.disabled=false}
     };
-    download.addEventListener('click',async e=>{if(window.pywebview&&window.pywebview.api){e.preventDefault();status.textContent='正在保存 MP4…';try{const path=await window.pywebview.api.download(download.getAttribute('href'));status.textContent='已保存到：'+path}catch(err){status.textContent='保存失败：'+err}}});
     function poll(id){const timer=setInterval(async()=>{try{const r=await fetch('/api/jobs/'+id),d=await r.json();if(!r.ok)throw Error(d.detail);status.textContent=d.message;fill.style.width=(d.progress||0)+'%';if(d.status==='completed'){clearInterval(timer);result.src=d.download_url;result.style.display='block';download.href=d.download_url;download.style.display='block';go.disabled=false}else if(d.status==='failed'){clearInterval(timer);go.disabled=false}}catch(e){clearInterval(timer);status.textContent=e.message;go.disabled=false}},800)}
   </script>
 </body>

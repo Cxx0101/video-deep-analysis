@@ -1,10 +1,64 @@
-# Build and delivery artifacts created outside the application source folder
-outputs/
-work/
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
 
-# Repository-local editor and operating-system files
-.vscode/
-.idea/
-.DS_Store
+# Local environments
+.venv/
+
+# Model weights, uploads, generated videos, and local wheel cache
+models/
+data/
+.cache/
+
+# Runtime and diagnostic logs
+*.log
+
+# Windows and editor files
 Thumbs.db
 Desktop.ini
+.vscode/
+.idea/
+
+# Additional Python quality and coverage artifacts
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Packaging metadata and local dependency artifacts
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+*.whl
+
+# Other conventional local virtual-environment names
+venv/
+env/
+ENV/
+
+# Download and inference-engine caches
+.hf-cache/
+.huggingface/
+torch_extensions/
+onnxruntime/
+
+# Local process state and secrets
+*.pid
+*.seed
+.env
+.env.*
+!.env.example
+
+# Other editor and operating-system files
+.DS_Store
+*.code-workspace
