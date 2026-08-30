@@ -2,7 +2,7 @@
 
 这是一个本地运行的网页工具：上传短视频或输入公开视频链接，即可生成深度图、人体姿态骨架和面部 478 点网格叠加后的 MP4。
 
-支持 Windows 10/11 和 macOS，使用 Python 3.11。服务只监听本机地址 `127.0.0.1`，不会把上传的视频传到远程服务。
+支持 Windows 10/11 和 macOS（Apple Silicon 需 macOS 11+，Intel 需 macOS 10.15+），使用 Python 3.11。服务只监听本机地址 `127.0.0.1`，不会把上传的视频传到远程服务。
 
 ## 功能
 
@@ -31,7 +31,7 @@ py -3.11 start.py
 ### macOS（终端）
 
 ```bash
-cd /你的项目路径/video_deep_analysis
+cd /你的项目路径/视频深度分析工具
 python3.11 start.py
 ```
 
