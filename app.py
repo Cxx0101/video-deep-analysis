@@ -15,11 +15,8 @@ from urllib.parse import urlparse
 import cv2
 import mediapipe as mp
 import numpy as np
-import onnxruntime as ort
-import torch
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
-from vendor_midas.midas_net_custom import MidasNet_small
 
 
 # The web service keeps all mutable files inside the project directory.
@@ -33,6 +30,78 @@ MODEL_DIR = STORAGE_DIR / "models"
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 for directory in (UPLOAD_DIR, RESULT_DIR, URL_DOWNLOAD_DIR, MODEL_DIR):
     directory.mkdir(parents=True, exist_ok=True)
+
+
+def configure_mediapipe_resource_path() -> None:
+    """Make MediaPipe's native resource loader work from Unicode Windows paths.
+
+    Some MediaPipe Windows builds pass resource paths through a non-Unicode
+    native layer.  A user can legitimately keep this project in a directory
+    with Chinese characters, so expose site-packages through an ASCII junction
+    when the installed path is not ASCII.  The junction only contains a link;
+    model data remains in the project directory.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import mediapipe.python.solution_base as solution_base
+
+        site_packages = Path(mp.__file__).resolve().parent.parent
+        if site_packages.as_posix().isascii():
+            return
+        cache_root = Path(os.environ.get("LOCALAPPDATA", "")) / "VideoDeepAnalysis" / "mediapipe"
+        if not cache_root.as_posix().isascii():
+            return
+        alias = cache_root / uuid.uuid5(uuid.NAMESPACE_URL, str(site_packages)).hex
+        alias.parent.mkdir(parents=True, exist_ok=True)
+        if not alias.exists():
+            created = subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(site_packages)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if created.returncode:
+                return
+        patched_file = alias / "mediapipe" / "python" / "solution_base.py"
+        if patched_file.is_file():
+            solution_base.__file__ = str(patched_file)
+    except (OSError, subprocess.SubprocessError):
+        # MediaPipe will retain its normal behavior on systems where a junction
+        # is unavailable; this should not prevent the web service from starting.
+        return
+
+
+configure_mediapipe_resource_path()
+
+
+def native_readable_path(path: Path) -> Path:
+    """Return an ASCII Windows junction path when a native library needs one."""
+    if os.name != "nt" or path.as_posix().isascii():
+        return path
+    try:
+        cache_root = Path(os.environ.get("LOCALAPPDATA", "")) / "VideoDeepAnalysis" / "path-links"
+        if not cache_root.as_posix().isascii():
+            return path
+        source_dir = path.resolve().parent
+        alias = cache_root / uuid.uuid5(uuid.NAMESPACE_URL, str(source_dir)).hex
+        alias.parent.mkdir(parents=True, exist_ok=True)
+        if not alias.exists():
+            created = subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(source_dir)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if created.returncode:
+                return path
+        candidate = alias / path.name
+        return candidate if candidate.is_file() else path
+    except (OSError, subprocess.SubprocessError):
+        return path
+
 
 # Keep all downloaded model files beside the project.
 
@@ -114,12 +183,10 @@ def encode_browser_mp4(silent_video: Path, source_video: Path, output_path: Path
 
 
 class VideoAnalyzer:
-    """Lazily loads the depth and landmark models exactly once per process."""
+    """Lazily loads CPU depth and landmark models once per process."""
 
     def __init__(self) -> None:
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.depth_model: Any | None = None
-        self.depth_ort: Any | None = None
+        self.depth_net: cv2.dnn.Net | None = None
         self.mp_pose = mp.solutions.pose
         self.mp_face = mp.solutions.face_mesh
         self.drawer = mp.solutions.drawing_utils
@@ -127,51 +194,36 @@ class VideoAnalyzer:
 
     @property
     def device_name(self) -> str:
-        if self.depth_ort is not None and "CUDAExecutionProvider" in self.depth_ort.get_providers():
-            return "NVIDIA CUDA (ONNX Runtime)"
-        if self.device.type == "cuda":
-            return f"NVIDIA GPU: {torch.cuda.get_device_name(0)}"
         return "CPU"
 
     def load_depth_model(self) -> None:
-        if self.depth_model is not None:
+        if self.depth_net is not None:
             return
-        # MiDaS Small is an official monocular-depth model. The single required
-        # weight is downloaded into the project directory on first use.
+        # MiDaS Small ONNX runs through OpenCV DNN on CPU. This avoids installing
+        # the much larger PyTorch/CUDA runtime while preserving depth analysis.
         with models_lock:
-            if self.depth_model is not None:
+            if self.depth_net is not None:
                 return
-            weights = MODEL_DIR / "midas_v21_small_256.pt"
+            weights = MODEL_DIR / "midas_v21_small_256.onnx"
             if not weights.exists():
                 from urllib.request import urlretrieve
 
-                urlretrieve("https://github.com/isl-org/MiDaS/releases/download/v2_1/midas_v21_small_256.pt", weights)
-            self.depth_model = MidasNet_small(path=str(weights))
-            self.depth_model.to(self.device).eval()
-            if "CUDAExecutionProvider" in ort.get_available_providers():
-                onnx_path = MODEL_DIR / "midas_v21_small_256.onnx"
-                if not onnx_path.exists():
-                    sample = torch.zeros((1, 3, 256, 256), dtype=torch.float32)
-                    torch.onnx.export(self.depth_model.cpu(), sample, str(onnx_path), input_names=["image"], output_names=["depth"], opset_version=17, dynamo=False)
-                self.depth_ort = ort.InferenceSession(str(onnx_path), providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+                urlretrieve("https://github.com/isl-org/MiDaS/releases/download/v2_1/model-small.onnx", weights)
+            net = cv2.dnn.readNetFromONNX(str(native_readable_path(weights)))
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            self.depth_net = net
 
     def depth_frame(self, rgb: np.ndarray) -> np.ndarray:
         self.load_depth_model()
-        assert self.depth_model is not None
-        resized = cv2.resize(rgb, (256, 256), interpolation=cv2.INTER_CUBIC).astype(np.float32) / 255.0
-        batch_array = np.ascontiguousarray(((resized - 0.5) / 0.5).transpose(2, 0, 1)[None])
-        if self.depth_ort is not None:
-            prediction = self.depth_ort.run(None, {"image": batch_array})[0][0]
-            prediction = cv2.resize(prediction, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_CUBIC)
-            values = prediction
-        else:
-            with torch.inference_mode():
-                batch = torch.from_numpy(batch_array).to(self.device)
-                prediction = self.depth_model(batch)
-                prediction = torch.nn.functional.interpolate(
-                    prediction.unsqueeze(1), size=rgb.shape[:2], mode="bicubic", align_corners=False
-                ).squeeze()
-                values = prediction.detach().float().cpu().numpy()
+        assert self.depth_net is not None
+        # These values are the official MiDaS v2.1 Small ONNX preprocessing.
+        blob = cv2.dnn.blobFromImage(
+            rgb, 1 / 255.0, (256, 256), (123.675, 116.28, 103.53), swapRB=True, crop=False
+        )
+        self.depth_net.setInput(blob)
+        prediction = self.depth_net.forward()[0]
+        values = cv2.resize(prediction, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_CUBIC)
         # Normalize each frame for readable relative depth. Brighter = nearer.
         normalized = cv2.normalize(values, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         return cv2.cvtColor(normalized, cv2.COLOR_GRAY2BGR)

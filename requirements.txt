@@ -6,14 +6,5 @@ mediapipe==0.10.20
 numpy==1.26.4
 jax==0.4.28
 jaxlib==0.4.28
-torch
-torchvision
-timm
-transformers==4.48.3
-onnx==1.17.0
-onnxscript
-onnxruntime-gpu==1.20.2; platform_system == "Windows"
-onnxruntime==1.16.2; platform_system == "Darwin"
-onnxruntime==1.20.2; platform_system != "Windows" and platform_system != "Darwin"
 yt-dlp[default]>=2025.1.15
 imageio-ffmpeg>=0.6.0
