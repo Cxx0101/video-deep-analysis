@@ -8,3 +8,5 @@ jax==0.4.28
 jaxlib==0.4.28
 yt-dlp[default]>=2025.1.15
 imageio-ffmpeg>=0.6.0
+# macOS fallback for OpenCV builds that cannot load the legacy MiDaS ONNX graph.
+onnxruntime==1.16.2; platform_system == "Darwin"

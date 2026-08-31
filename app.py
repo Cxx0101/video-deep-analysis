@@ -5,6 +5,7 @@ import os
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 import shutil
 import subprocess
+import sys
 import threading
 import traceback
 import uuid
@@ -187,6 +188,8 @@ class VideoAnalyzer:
 
     def __init__(self) -> None:
         self.depth_net: cv2.dnn.Net | None = None
+        self.depth_session: Any | None = None
+        self.depth_input_name: str | None = None
         self.mp_pose = mp.solutions.pose
         self.mp_face = mp.solutions.face_mesh
         self.drawer = mp.solutions.drawing_utils
@@ -197,32 +200,65 @@ class VideoAnalyzer:
         return "CPU"
 
     def load_depth_model(self) -> None:
-        if self.depth_net is not None:
+        if self.depth_net is not None or self.depth_session is not None:
             return
         # MiDaS Small ONNX runs through OpenCV DNN on CPU. This avoids installing
         # the much larger PyTorch/CUDA runtime while preserving depth analysis.
         with models_lock:
-            if self.depth_net is not None:
+            if self.depth_net is not None or self.depth_session is not None:
                 return
             weights = MODEL_DIR / "midas_v21_small_256.onnx"
-            if not weights.exists():
+            min_model_bytes = 50 * 1024 * 1024
+            if not weights.is_file() or weights.stat().st_size < min_model_bytes:
                 from urllib.request import urlretrieve
 
-                urlretrieve("https://github.com/isl-org/MiDaS/releases/download/v2_1/model-small.onnx", weights)
-            net = cv2.dnn.readNetFromONNX(str(native_readable_path(weights)))
-            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-            self.depth_net = net
+                partial = weights.with_suffix(".onnx.part")
+                partial.unlink(missing_ok=True)
+                try:
+                    urlretrieve("https://github.com/isl-org/MiDaS/releases/download/v2_1/model-small.onnx", partial)
+                    if partial.stat().st_size < min_model_bytes:
+                        raise RuntimeError("下载的深度模型不完整")
+                    partial.replace(weights)
+                finally:
+                    partial.unlink(missing_ok=True)
+            model_path = native_readable_path(weights)
+            try:
+                net = cv2.dnn.readNetFromONNX(str(model_path))
+                net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                self.depth_net = net
+                return
+            except cv2.error as opencv_error:
+                # Some macOS OpenCV wheels reject this legacy ONNX graph.  Use
+                # the CPU-only ONNX Runtime fallback there without reintroducing
+                # PyTorch or CUDA dependencies on Windows.
+                if sys.platform != "darwin":
+                    raise RuntimeError(f"深度模型加载失败：{opencv_error}") from opencv_error
+                try:
+                    import onnxruntime as ort
+
+                    session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+                    self.depth_session = session
+                    self.depth_input_name = session.get_inputs()[0].name
+                    return
+                except Exception as runtime_error:
+                    raise RuntimeError(
+                        f"深度模型加载失败。OpenCV：{opencv_error}；ONNX Runtime：{runtime_error}"
+                    ) from runtime_error
 
     def depth_frame(self, rgb: np.ndarray) -> np.ndarray:
         self.load_depth_model()
-        assert self.depth_net is not None
+        assert self.depth_net is not None or self.depth_session is not None
         # These values are the official MiDaS v2.1 Small ONNX preprocessing.
         blob = cv2.dnn.blobFromImage(
             rgb, 1 / 255.0, (256, 256), (123.675, 116.28, 103.53), swapRB=True, crop=False
         )
-        self.depth_net.setInput(blob)
-        prediction = self.depth_net.forward()[0]
+        if self.depth_net is not None:
+            self.depth_net.setInput(blob)
+            prediction = self.depth_net.forward()[0]
+        else:
+            assert self.depth_session is not None and self.depth_input_name is not None
+            prediction = self.depth_session.run(None, {self.depth_input_name: blob})[0][0]
         values = cv2.resize(prediction, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_CUBIC)
         # Normalize each frame for readable relative depth. Brighter = nearer.
         normalized = cv2.normalize(values, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)

@@ -37,7 +37,7 @@ python3.11 start.py
 
 启动后会自动打开浏览器；也可手动访问 <http://127.0.0.1:8000>。按 `Ctrl+C` 停止服务。
 
-首次使用深度图功能时，程序会自动下载 MiDaS Small ONNX 模型到本项目的 `models/` 目录。深度图固定使用 OpenCV DNN 的 CPU 推理；Windows 和 macOS 的运行方式一致，无需 CUDA。
+首次使用深度图功能时，程序会自动下载 MiDaS Small ONNX 模型到本项目的 `models/` 目录。深度图固定使用 CPU 推理：默认使用 OpenCV DNN，macOS 的部分 OpenCV 版本无法加载该模型时会自动切换到 ONNX Runtime CPU；无需 CUDA。
 
 ## 使用方法
 
