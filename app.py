@@ -117,6 +117,13 @@ MODES = {
     "face": "面部 478 点网格",
     "all": "深度图 + 人体姿态 + 面部网格",
 }
+PORTRAIT_MODES = {
+    "blur": "背景虚化",
+    "white": "白色背景",
+    "black": "黑色背景",
+    "mask": "人像蒙版",
+    "transparent": "透明背景（WebM）",
+}
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".flv"}
 
 jobs: dict[str, dict[str, Any]] = {}
@@ -248,6 +255,7 @@ class VideoAnalyzer:
         self.depth_input_name: str | None = None
         self.mp_pose = mp.solutions.pose
         self.mp_face = mp.solutions.face_mesh
+        self.mp_selfie_segmentation = mp.solutions.selfie_segmentation
         self.drawer = mp.solutions.drawing_utils
         self.styles = mp.solutions.drawing_styles
 
@@ -413,6 +421,162 @@ class VideoAnalyzer:
         finally:
             silent_output.unlink(missing_ok=True)
 
+    def render_transparent_portrait(self, input_path: Path, output_path: Path, progress: dict[str, Any]) -> None:
+        """Write a VP9 WebM with an alpha channel and the original audio."""
+        capture = cv2.VideoCapture(str(input_path))
+        if not capture.isOpened():
+            raise ValueError("无法读取该视频。请上传常见的视频格式后重试。")
+        orientation_auto = getattr(cv2, "CAP_PROP_ORIENTATION_AUTO", None)
+        if orientation_auto is not None:
+            capture.set(orientation_auto, 0)
+        rotation = source_rotation_degrees(input_path)
+        if not rotation:
+            orientation_meta = getattr(cv2, "CAP_PROP_ORIENTATION_META", None)
+            if orientation_meta is not None:
+                rotation = int(round(capture.get(orientation_meta))) % 360
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        if not fps or fps < 1 or fps > 240:
+            fps = 30.0
+        width, height = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if rotation in {90, 270}:
+            width, height = height, width
+        if width < 2 or height < 2:
+            capture.release()
+            raise ValueError("视频尺寸无效。")
+        frame_count = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+        command = [
+            ffmpeg_executable(), "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgra",
+            "-video_size", f"{width}x{height}", "-framerate", str(fps), "-i", "-",
+            "-i", str(input_path), "-map", "0:v:0", "-map", "1:a?",
+            "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-b:v", "0", "-crf", "32",
+            "-auto-alt-ref", "0", "-c:a", "libopus", "-b:a", "128k", "-shortest",
+            "-map_metadata", "-1", "-metadata:s:v:0", "alpha_mode=1", str(output_path),
+        ]
+        encoder = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        segmenter = self.mp_selfie_segmentation.SelfieSegmentation(model_selection=0)
+        try:
+            assert encoder.stdin is not None
+            index = 0
+            while True:
+                ok, bgr = capture.read()
+                if not ok:
+                    break
+                if rotation == 90:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                elif rotation == 180:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_180)
+                elif rotation == 270:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                result = segmenter.process(rgb)
+                mask = result.segmentation_mask
+                if mask is None:
+                    raise RuntimeError("未能生成人像蒙版。")
+                alpha = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), 2.0)
+                alpha = (np.clip(alpha, 0.0, 1.0) * 255).astype(np.uint8)
+                bgra = np.dstack((bgr, alpha))
+                encoder.stdin.write(np.ascontiguousarray(bgra).tobytes())
+                index += 1
+                progress["progress"] = round(index / frame_count * 100, 1)
+                progress["message"] = f"正在生成透明人像视频：{index}/{frame_count} 帧"
+        except Exception:
+            if encoder.stdin is not None:
+                encoder.stdin.close()
+            encoder.wait()
+            output_path.unlink(missing_ok=True)
+            raise
+        finally:
+            capture.release()
+            segmenter.close()
+        assert encoder.stdin is not None and encoder.stderr is not None
+        encoder.stdin.close()
+        error_output = encoder.stderr.read().decode("utf-8", errors="replace")
+        if encoder.wait() != 0 or not output_path.is_file() or output_path.stat().st_size == 0:
+            output_path.unlink(missing_ok=True)
+            detail = error_output.strip().splitlines()[-1] if error_output.strip() else "未知 FFmpeg 错误"
+            raise RuntimeError(f"透明 WebM 导出失败：{detail}")
+
+    def render_portrait(
+        self, input_path: Path, output_path: Path, portrait_mode: str, progress: dict[str, Any]
+    ) -> None:
+        """Separate a person from the background and preserve the source audio."""
+        if portrait_mode not in PORTRAIT_MODES:
+            raise ValueError("未知的人像与背景分离模式")
+        if portrait_mode == "transparent":
+            self.render_transparent_portrait(input_path, output_path, progress)
+            return
+        capture = cv2.VideoCapture(str(input_path))
+        if not capture.isOpened():
+            raise ValueError("无法读取该视频。请上传常见的视频格式后重试。")
+        orientation_auto = getattr(cv2, "CAP_PROP_ORIENTATION_AUTO", None)
+        if orientation_auto is not None:
+            capture.set(orientation_auto, 0)
+        rotation = source_rotation_degrees(input_path)
+        if not rotation:
+            orientation_meta = getattr(cv2, "CAP_PROP_ORIENTATION_META", None)
+            if orientation_meta is not None:
+                rotation = int(round(capture.get(orientation_meta))) % 360
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        if not fps or fps < 1 or fps > 240:
+            fps = 30.0
+        width, height = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if rotation in {90, 270}:
+            width, height = height, width
+        if width < 2 or height < 2:
+            capture.release()
+            raise ValueError("视频尺寸无效。")
+        frame_count = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+        silent_output = output_path.with_name(f"{output_path.stem}.silent.mp4")
+        writer = cv2.VideoWriter(str(silent_output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not writer.isOpened():
+            capture.release()
+            raise RuntimeError("无法创建人像分离输出文件。")
+
+        segmenter = self.mp_selfie_segmentation.SelfieSegmentation(model_selection=0)
+        try:
+            index = 0
+            while True:
+                ok, bgr = capture.read()
+                if not ok:
+                    break
+                if rotation == 90:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                elif rotation == 180:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_180)
+                elif rotation == 270:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                result = segmenter.process(rgb)
+                mask = result.segmentation_mask
+                if mask is None:
+                    raise RuntimeError("未能生成人像蒙版。")
+                alpha = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), 2.0)
+                alpha = np.clip(alpha, 0.0, 1.0)[..., None]
+                if portrait_mode == "mask":
+                    values = (alpha[..., 0] >= 0.5).astype(np.uint8) * 255
+                    canvas = cv2.cvtColor(values, cv2.COLOR_GRAY2BGR)
+                else:
+                    if portrait_mode == "blur":
+                        background = cv2.GaussianBlur(bgr, (0, 0), 25)
+                    elif portrait_mode == "white":
+                        background = np.full_like(bgr, 255)
+                    else:
+                        background = np.zeros_like(bgr)
+                    canvas = (bgr.astype(np.float32) * alpha + background.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
+                writer.write(canvas)
+                index += 1
+                progress["progress"] = round(index / frame_count * 100, 1)
+                progress["message"] = f"正在分离人像与背景：{index}/{frame_count} 帧"
+        finally:
+            capture.release()
+            writer.release()
+            segmenter.close()
+        try:
+            progress.update(progress=98, message="正在保留原始音频并转码为网页兼容 MP4…")
+            encode_browser_mp4(silent_output, input_path, output_path)
+        finally:
+            silent_output.unlink(missing_ok=True)
+
 
 analyzer = VideoAnalyzer()
 app = FastAPI(title="视频深度分析工具")
@@ -522,13 +686,16 @@ async def create_source_job(
     background_tasks: BackgroundTasks,
     tool: str = Form(...),
     mode: str | None = Form(None),
+    portrait_mode: str | None = Form(None),
 ) -> dict[str, str]:
     """Run a selected tool against an existing uploaded/downloaded source."""
     _source, input_path = get_source_path(source_id)
-    if tool not in {"analysis", "separate"}:
+    if tool not in {"analysis", "separate", "portrait"}:
         raise HTTPException(400, "未知的视频工具")
     if tool == "analysis" and mode not in MODES:
         raise HTTPException(400, "请选择有效的分析模式")
+    if tool == "portrait" and portrait_mode not in PORTRAIT_MODES:
+        raise HTTPException(400, "请选择有效的人像与背景分离模式")
 
     job_id = uuid.uuid4().hex
     if tool == "analysis":
@@ -538,7 +705,7 @@ async def create_source_job(
             "tool": tool, "mode": mode, "source_id": source_id, "output": str(output_path),
         }
         background_tasks.add_task(process_source_analysis_job, job_id, input_path, output_path, str(mode))
-    else:
+    elif tool == "separate":
         video_output = RESULT_DIR / f"{job_id}-silent.mp4"
         audio_output = RESULT_DIR / f"{job_id}-audio.mp3"
         jobs[job_id] = {
@@ -547,6 +714,14 @@ async def create_source_job(
             "outputs": {"video": str(video_output), "audio": str(audio_output)},
         }
         background_tasks.add_task(process_source_separation_job, job_id, input_path, video_output, audio_output)
+    else:
+        output_suffix = ".webm" if portrait_mode == "transparent" else ".mp4"
+        output_path = RESULT_DIR / f"{job_id}-portrait{output_suffix}"
+        jobs[job_id] = {
+            "status": "queued", "progress": 0, "message": "人像与背景分离任务已排队",
+            "tool": tool, "portrait_mode": portrait_mode, "source_id": source_id, "output": str(output_path),
+        }
+        background_tasks.add_task(process_source_portrait_job, job_id, input_path, output_path, str(portrait_mode))
     return {"job_id": job_id}
 
 
@@ -574,6 +749,20 @@ def process_source_separation_job(
     except Exception as exc:
         traceback.print_exc()
         job.update(status="failed", message=f"音视频分离失败：{exc}")
+
+
+def process_source_portrait_job(
+    job_id: str, input_path: Path, output_path: Path, portrait_mode: str
+) -> None:
+    job = jobs[job_id]
+    try:
+        with processing_lock:
+            job.update(status="processing", message="正在加载人像分离模型…")
+            analyzer.render_portrait(input_path, output_path, portrait_mode, job)
+        job.update(status="completed", progress=100, message="人像与背景分离完成，可以预览和下载。")
+    except Exception as exc:
+        traceback.print_exc()
+        job.update(status="failed", message=f"人像与背景分离失败：{exc}")
 
 
 @app.post("/api/jobs")
@@ -886,6 +1075,8 @@ def download_job(job_id: str) -> FileResponse:
     path = Path(job["output"])
     if not path.exists():
         raise HTTPException(404, "处理结果文件丢失")
+    if path.suffix.lower() == ".webm":
+        return FileResponse(path, media_type="video/webm", filename=f"portrait-transparent-{job_id[:8]}.webm")
     return FileResponse(path, media_type="video/mp4", filename=f"deep-analysis-{job_id[:8]}.mp4")
 
 

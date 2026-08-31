@@ -37,11 +37,13 @@
 
 - `tool=analysis`，并传入 `mode`：`depth`、`pose`、`depth_pose`、`face`、`all`。
 - `tool=separate`：导出无声 MP4 和 MP3 音频。
+- `tool=portrait`，并传入 `portrait_mode`：`blur`、`white`、`black`、`mask` 或 `transparent`。除 `transparent` 外输出保留原始音频的 MP4；透明模式输出带 Alpha 通道、保留音频的 VP9 WebM。
 
 任务进度：`GET /api/jobs/{job_id}`。
 
 - 分析任务完成后返回 `download_url`。
 - 分离任务完成后返回 `downloads.video` 与 `downloads.audio`。
+- 人像与背景分离任务完成后返回 `download_url`。
 
 保留了旧接口（`/api/jobs`、`/api/downloads/{job_id}/process` 等），以维持原有自动化回归测试兼容性；新页面应优先使用 `/api/sources/` 接口。
 
@@ -60,6 +62,7 @@
 
 - `#analysisNav` ↔ `#analysisPanel`：五种视频智能分析方式。
 - `#separateNav` ↔ `#separatePanel`：音视频分离。
+- `#portraitNav` ↔ `#portraitPanel`：人像与背景分离。
 
 切换统一由 `selectWorkspace()` 处理，必须同时更新菜单和工作区的 `active` 类，避免出现多个菜单同时高亮或不匹配的工作区。
 
@@ -78,8 +81,9 @@
 
 1. 本地上传 → 预览 → 音视频分离 → 下载 MP4 和 MP3。
 2. 使用同一个 `source_id` 再提交一次分析任务，无需再次上传。
-3. 左侧两个菜单互斥高亮，且只显示对应工作区。
-4. 服务保持在 8000 端口可访问：`GET /api/health`。
+3. 使用同一个 `source_id` 运行人像与背景分离，至少验证背景虚化和人像蒙版可解码。
+4. 左侧三个菜单互斥高亮，且只显示对应工作区。
+5. 服务保持在 8000 端口可访问：`GET /api/health`。
 
 ## 运行和清理注意事项
 
