@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+import re
 import shutil
 import subprocess
 import sys
@@ -27,9 +28,12 @@ DATA_DIR = STORAGE_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 RESULT_DIR = DATA_DIR / "results"
 URL_DOWNLOAD_DIR = DATA_DIR / "url_downloads"
+COOKIE_DIR = DATA_DIR / "download_cookies"
+COOKIE_STORE = DATA_DIR / "cookies.txt"
 MODEL_DIR = STORAGE_DIR / "models"
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
-for directory in (UPLOAD_DIR, RESULT_DIR, URL_DOWNLOAD_DIR, MODEL_DIR):
+MAX_COOKIE_BYTES = 5 * 1024 * 1024
+for directory in (UPLOAD_DIR, RESULT_DIR, URL_DOWNLOAD_DIR, COOKIE_DIR, MODEL_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -116,6 +120,10 @@ MODES = {
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".flv"}
 
 jobs: dict[str, dict[str, Any]] = {}
+# A source is intentionally separate from a processing job.  A local upload or
+# downloaded URL can therefore be previewed once and passed to any current or
+# future video tool without uploading/downloading it again.
+sources: dict[str, dict[str, Any]] = {}
 models_lock = threading.Lock()
 processing_lock = threading.Lock()
 
@@ -181,6 +189,54 @@ def encode_browser_mp4(silent_video: Path, source_video: Path, output_path: Path
         raise RuntimeError(f"MP4 转码失败：{detail}")
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError("MP4 转码未生成有效输出文件。")
+
+
+def source_rotation_filter(video_path: Path) -> str | None:
+    """Return an FFmpeg filter that turns display rotation into real pixels."""
+    rotation = source_rotation_degrees(video_path)
+    if rotation == 90:
+        return "transpose=2"  # counter-clockwise, matching the analysis renderer
+    if rotation == 180:
+        return "hflip,vflip"
+    if rotation == 270:
+        return "transpose=1"
+    return None
+
+
+def separate_audio_video(source_video: Path, video_output: Path, audio_output: Path) -> None:
+    """Export a browser-ready silent MP4 and the source's first audio track."""
+    video_command = [
+        ffmpeg_executable(), "-y", "-noautorotate", "-i", str(source_video),
+        "-map", "0:v:0", "-an",
+    ]
+    rotation_filter = source_rotation_filter(source_video)
+    if rotation_filter:
+        video_command.extend(["-vf", rotation_filter])
+    video_command.extend([
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        "-pix_fmt", "yuv420p", "-map_metadata", "-1",
+        "-metadata:s:v:0", "rotate=0", "-movflags", "+faststart", str(video_output),
+    ])
+    audio_command = [
+        ffmpeg_executable(), "-y", "-i", str(source_video),
+        "-map", "0:a:0", "-vn", "-c:a", "libmp3lame", "-q:a", "2", str(audio_output),
+    ]
+    try:
+        for command, label in ((video_command, "无声视频"), (audio_command, "音频")):
+            completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if completed.returncode != 0:
+                detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "未知 FFmpeg 错误"
+                if label == "音频":
+                    raise RuntimeError(f"音频导出失败：该视频可能不含音轨，或音频格式不受支持。{detail}")
+                raise RuntimeError(f"{label}导出失败：{detail}")
+        if not video_output.is_file() or video_output.stat().st_size == 0:
+            raise RuntimeError("无声视频导出未生成有效文件。")
+        if not audio_output.is_file() or audio_output.stat().st_size == 0:
+            raise RuntimeError("音频导出未生成有效文件。")
+    except Exception:
+        video_output.unlink(missing_ok=True)
+        audio_output.unlink(missing_ok=True)
+        raise
 
 
 class VideoAnalyzer:
@@ -372,6 +428,154 @@ def health() -> dict[str, str]:
     return {"status": "ok", "device": analyzer.device_name}
 
 
+@app.get("/api/cookies/status")
+def cookie_status() -> dict[str, Any]:
+    if not COOKIE_STORE.is_file():
+        return {"saved": False}
+    return {
+        "saved": True,
+        "updated_at": int(COOKIE_STORE.stat().st_mtime),
+    }
+
+
+@app.delete("/api/cookies")
+def clear_saved_cookies() -> dict[str, bool]:
+    COOKIE_STORE.unlink(missing_ok=True)
+    return {"cleared": True}
+
+
+@app.post("/api/cookies")
+async def save_cookies(cookie_file: UploadFile = File(...)) -> dict[str, bool]:
+    await update_cookie_store(cookie_file)
+    return {"saved": True}
+
+
+def register_source(
+    source_id: str,
+    path: Path,
+    name: str,
+    origin: str,
+    source_dir: Path | None = None,
+) -> None:
+    sources[source_id] = {
+        "path": str(path),
+        "name": name,
+        "origin": origin,
+        "source_dir": str(source_dir) if source_dir else None,
+    }
+
+
+async def save_uploaded_source(video: UploadFile) -> tuple[str, Path, str]:
+    """Save one uploaded video so it can be reused by multiple tool jobs."""
+    original_name = Path(video.filename or "video.mp4").name
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in VIDEO_SUFFIXES:
+        await video.close()
+        raise HTTPException(400, "请上传 MP4、MOV、AVI、MKV、WebM 或 M4V 视频")
+    source_id = uuid.uuid4().hex
+    input_path = UPLOAD_DIR / f"{source_id}{suffix}"
+    size = 0
+    try:
+        with input_path.open("wb") as destination:
+            while chunk := await video.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, "视频超过 500 MB 限制")
+                destination.write(chunk)
+    except Exception:
+        input_path.unlink(missing_ok=True)
+        raise
+    finally:
+        await video.close()
+    register_source(source_id, input_path, original_name, "upload")
+    return source_id, input_path, original_name
+
+
+@app.post("/api/sources/upload")
+async def upload_source(video: UploadFile = File(...)) -> dict[str, str]:
+    """Create a reusable source from a local upload before selecting a tool."""
+    source_id, _input_path, original_name = await save_uploaded_source(video)
+    return {
+        "source_id": source_id,
+        "name": original_name,
+        "preview_url": f"/api/sources/{source_id}/preview",
+    }
+
+
+def get_source_path(source_id: str) -> tuple[dict[str, Any], Path]:
+    source = sources.get(source_id)
+    path = Path(str(source.get("path", ""))) if source else None
+    if not source or not path.is_file():
+        raise HTTPException(404, "视频来源不存在，或服务已重启")
+    return source, path
+
+
+@app.get("/api/sources/{source_id}/preview")
+def preview_source(source_id: str) -> FileResponse:
+    _source, path = get_source_path(source_id)
+    return FileResponse(path, media_type="video/mp4")
+
+
+@app.post("/api/sources/{source_id}/jobs")
+async def create_source_job(
+    source_id: str,
+    background_tasks: BackgroundTasks,
+    tool: str = Form(...),
+    mode: str | None = Form(None),
+) -> dict[str, str]:
+    """Run a selected tool against an existing uploaded/downloaded source."""
+    _source, input_path = get_source_path(source_id)
+    if tool not in {"analysis", "separate"}:
+        raise HTTPException(400, "未知的视频工具")
+    if tool == "analysis" and mode not in MODES:
+        raise HTTPException(400, "请选择有效的分析模式")
+
+    job_id = uuid.uuid4().hex
+    if tool == "analysis":
+        output_path = RESULT_DIR / f"{job_id}.mp4"
+        jobs[job_id] = {
+            "status": "queued", "progress": 0, "message": "处理任务已排队",
+            "tool": tool, "mode": mode, "source_id": source_id, "output": str(output_path),
+        }
+        background_tasks.add_task(process_source_analysis_job, job_id, input_path, output_path, str(mode))
+    else:
+        video_output = RESULT_DIR / f"{job_id}-silent.mp4"
+        audio_output = RESULT_DIR / f"{job_id}-audio.mp3"
+        jobs[job_id] = {
+            "status": "queued", "progress": 0, "message": "音视频分离任务已排队",
+            "tool": tool, "source_id": source_id,
+            "outputs": {"video": str(video_output), "audio": str(audio_output)},
+        }
+        background_tasks.add_task(process_source_separation_job, job_id, input_path, video_output, audio_output)
+    return {"job_id": job_id}
+
+
+def process_source_analysis_job(job_id: str, input_path: Path, output_path: Path, mode: str) -> None:
+    job = jobs[job_id]
+    try:
+        with processing_lock:
+            job.update(status="processing", message="正在加载分析模型…")
+            analyzer.render(input_path, output_path, mode, job)
+        job.update(status="completed", progress=100, message="处理完成，可以预览和下载。")
+    except Exception as exc:
+        traceback.print_exc()
+        job.update(status="failed", message=f"处理失败：{exc}")
+
+
+def process_source_separation_job(
+    job_id: str, input_path: Path, video_output: Path, audio_output: Path
+) -> None:
+    job = jobs[job_id]
+    try:
+        with processing_lock:
+            job.update(status="processing", progress=10, message="正在导出无声视频…")
+            separate_audio_video(input_path, video_output, audio_output)
+        job.update(status="completed", progress=100, message="音频和无声视频已分离，可以预览和下载。")
+    except Exception as exc:
+        traceback.print_exc()
+        job.update(status="failed", message=f"音视频分离失败：{exc}")
+
+
 @app.post("/api/jobs")
 async def create_job(background_tasks: BackgroundTasks, mode: str = Form(...), video: UploadFile = File(...)) -> dict[str, str]:
     if mode not in MODES:
@@ -401,13 +605,57 @@ async def create_job(background_tasks: BackgroundTasks, mode: str = Form(...), v
 
 
 def validate_video_url(source_url: str) -> str:
-    parsed = urlparse(source_url.strip())
+    source_url = source_url.strip()
+    # Mobile apps often copy a whole share message. Prefer the first embedded
+    # URL so users can paste the message without manually extracting it.
+    candidates = re.findall(r"https?://[^\s<>\"'，。！？、）】》]+", source_url)
+    if candidates:
+        source_url = candidates[0].rstrip(".,;:!?)]}）】》")
+    parsed = urlparse(source_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        if "抖音" in source_url or re.search(r"\b[A-Za-z0-9@._-]{3,}:/", source_url):
+            raise ValueError(
+                "识别到抖音 App 口令，但其中不含可下载链接。请在抖音点“分享 → 复制链接”，"
+                "然后粘贴包含 https://v.douyin.com/ 的完整分享文案。"
+            )
         raise ValueError("请输入完整的 http 或 https 视频链接。")
-    return source_url.strip()
+    return source_url
 
 
-def download_video_from_url(source_url: str, job_id: str, job: dict[str, Any]) -> tuple[Path, Path]:
+async def update_cookie_store(cookie_file: UploadFile | None) -> bool:
+    """Persist a Netscape cookies.txt locally for future URL downloads."""
+    if cookie_file is None or not cookie_file.filename:
+        return False
+    try:
+        if Path(cookie_file.filename).suffix.lower() not in {"", ".txt"}:
+            raise HTTPException(400, "Cookie 文件必须是 .txt 格式")
+        payload = await cookie_file.read(MAX_COOKIE_BYTES + 1)
+        if not payload:
+            raise HTTPException(400, "Cookie 文件为空")
+        if len(payload) > MAX_COOKIE_BYTES:
+            raise HTTPException(413, "Cookie 文件不能超过 5 MB")
+        if b"\t" not in payload:
+            raise HTTPException(400, "请上传 Netscape 格式的 cookies.txt")
+        temporary = COOKIE_DIR / f"{uuid.uuid4().hex}.tmp"
+        temporary.write_bytes(payload)
+        temporary.replace(COOKIE_STORE)
+        return True
+    finally:
+        await cookie_file.close()
+
+
+def copy_saved_cookie_for_job(job_id: str) -> Path | None:
+    """Use a disposable copy so the saved Cookie is never passed to cleanup."""
+    if not COOKIE_STORE.is_file() or COOKIE_STORE.stat().st_size == 0:
+        return None
+    temporary = COOKIE_DIR / f"{job_id}.txt"
+    shutil.copyfile(COOKIE_STORE, temporary)
+    return temporary
+
+
+def download_video_from_url(
+    source_url: str, job_id: str, job: dict[str, Any], cookie_path: Path | None = None
+) -> tuple[Path, Path]:
     """Download a single public video in a private job directory with yt-dlp."""
     try:
         import yt_dlp
@@ -417,6 +665,14 @@ def download_video_from_url(source_url: str, job_id: str, job: dict[str, Any]) -
     download_dir = URL_DOWNLOAD_DIR / job_id
     download_dir.mkdir(parents=True, exist_ok=False)
     job.update(status="downloading", progress=0, message="正在从视频链接下载…")
+    def on_progress(event: dict[str, Any]) -> None:
+        if event.get("status") != "downloading":
+            return
+        total = event.get("total_bytes") or event.get("total_bytes_estimate")
+        downloaded = event.get("downloaded_bytes", 0)
+        if total:
+            job.update(progress=min(95, round(downloaded / total * 95, 1)), message="正在下载视频…")
+
     options = {
         "format": "bv*+ba/b",
         "merge_output_format": "mp4",
@@ -431,7 +687,10 @@ def download_video_from_url(source_url: str, job_id: str, job: dict[str, Any]) -
         "quiet": True,
         "noprogress": True,
         "no_warnings": True,
+        "progress_hooks": [on_progress],
     }
+    if cookie_path is not None:
+        options["cookiefile"] = str(cookie_path)
     with yt_dlp.YoutubeDL(options) as downloader:
         downloader.extract_info(source_url, download=True)
 
@@ -445,6 +704,99 @@ def download_video_from_url(source_url: str, job_id: str, job: dict[str, Any]) -
     if input_path.stat().st_size > MAX_UPLOAD_BYTES:
         raise RuntimeError("下载的视频超过 500 MB 限制。")
     return input_path, download_dir
+
+
+@app.post("/api/downloads")
+async def create_download_preview(
+    background_tasks: BackgroundTasks,
+    source_url: str = Form(...),
+    cookie_file: UploadFile | None = File(None),
+) -> dict[str, str]:
+    """Download a URL first, then let the user preview it before processing."""
+    try:
+        source_url = validate_video_url(source_url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    job_id = uuid.uuid4().hex
+    cookie_updated = await update_cookie_store(cookie_file)
+    cookie_path = copy_saved_cookie_for_job(job_id)
+    jobs[job_id] = {
+        "status": "queued",
+        "progress": 0,
+        "message": "下载任务已排队",
+        "source_url": source_url,
+        "kind": "download_preview",
+        "cookie_path": str(cookie_path) if cookie_path else None,
+        "using_cookies": bool(cookie_path),
+        "cookie_updated": cookie_updated,
+    }
+    background_tasks.add_task(download_preview_job, job_id, source_url, cookie_path)
+    return {"job_id": job_id}
+
+
+def download_preview_job(job_id: str, source_url: str, cookie_path: Path | None = None) -> None:
+    job = jobs[job_id]
+    try:
+        input_path, download_dir = download_video_from_url(source_url, job_id, job, cookie_path)
+        register_source(job_id, input_path, input_path.name, "download", download_dir)
+        job.update(
+            status="ready",
+            progress=100,
+            message="视频已下载，可以预览并选择处理工具。",
+            source_path=str(input_path),
+            source_dir=str(download_dir),
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        job.update(status="failed", message=f"下载失败：{exc}")
+    finally:
+        if cookie_path is not None:
+            cookie_path.unlink(missing_ok=True)
+
+
+@app.post("/api/downloads/{job_id}/process")
+async def process_download_preview(
+    job_id: str, background_tasks: BackgroundTasks, mode: str = Form(...)
+) -> dict[str, str]:
+    if mode not in MODES:
+        raise HTTPException(400, "未知的处理模式")
+    job = jobs.get(job_id)
+    if not job or job.get("kind") != "download_preview":
+        raise HTTPException(404, "下载任务不存在")
+    if job.get("status") != "ready":
+        raise HTTPException(409, "请等待视频下载完成后再开始处理")
+    input_path = Path(str(job.get("source_path", "")))
+    if not input_path.is_file():
+        raise HTTPException(404, "下载的视频文件已不存在")
+    output_path = RESULT_DIR / f"{job_id}.mp4"
+    job.update(status="queued", progress=0, message="处理任务已排队", mode=mode, output=str(output_path))
+    background_tasks.add_task(process_downloaded_preview, job_id, input_path, output_path, mode)
+    return {"job_id": job_id}
+
+
+def process_downloaded_preview(job_id: str, input_path: Path, output_path: Path, mode: str) -> None:
+    job = jobs[job_id]
+    try:
+        with processing_lock:
+            job.update(status="processing", message="正在加载分析模型…")
+            analyzer.render(input_path, output_path, mode, job)
+        job.update(status="completed", progress=100, message="处理完成，可以预览和下载。")
+    except Exception as exc:
+        traceback.print_exc()
+        job.update(status="failed", message=f"处理失败：{exc}")
+    finally:
+        source_dir = Path(str(job.get("source_dir", "")))
+        if source_dir.is_dir():
+            shutil.rmtree(source_dir, ignore_errors=True)
+
+
+@app.get("/api/downloads/{job_id}/preview")
+def preview_download(job_id: str) -> FileResponse:
+    job = jobs.get(job_id)
+    path = Path(str(job.get("source_path", ""))) if job else None
+    if not job or job.get("status") != "ready" or not path.is_file():
+        raise HTTPException(404, "可预览的视频不存在")
+    return FileResponse(path, media_type="video/mp4", filename=f"download-{job_id[:8]}{path.suffix}")
 
 
 @app.post("/api/jobs/from-url")
@@ -509,9 +861,20 @@ def get_job(job_id: str) -> dict[str, Any]:
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(404, "任务不存在或服务已重启")
-    response = {key: value for key, value in job.items() if key != "output"}
+    response = {
+        key: value for key, value in job.items()
+        if key not in {"output", "outputs", "source_path", "source_dir", "cookie_path"}
+    }
+    if job.get("kind") == "download_preview" and job["status"] == "ready":
+        response["preview_url"] = f"/api/downloads/{job_id}/preview"
     if job["status"] == "completed":
-        response["download_url"] = f"/api/jobs/{job_id}/download"
+        if job.get("tool") == "separate":
+            response["downloads"] = {
+                "video": f"/api/jobs/{job_id}/download/video",
+                "audio": f"/api/jobs/{job_id}/download/audio",
+            }
+        else:
+            response["download_url"] = f"/api/jobs/{job_id}/download"
     return response
 
 
@@ -524,3 +887,19 @@ def download_job(job_id: str) -> FileResponse:
     if not path.exists():
         raise HTTPException(404, "处理结果文件丢失")
     return FileResponse(path, media_type="video/mp4", filename=f"deep-analysis-{job_id[:8]}.mp4")
+
+
+@app.get("/api/jobs/{job_id}/download/{artifact}")
+def download_job_artifact(job_id: str, artifact: str) -> FileResponse:
+    job = jobs.get(job_id)
+    outputs = job.get("outputs") if job else None
+    if not job or job.get("status") != "completed" or not isinstance(outputs, dict):
+        raise HTTPException(404, "处理结果不存在")
+    if artifact not in {"video", "audio"} or artifact not in outputs:
+        raise HTTPException(404, "请求的导出文件不存在")
+    path = Path(str(outputs[artifact]))
+    if not path.is_file():
+        raise HTTPException(404, "导出文件已丢失")
+    if artifact == "video":
+        return FileResponse(path, media_type="video/mp4", filename=f"silent-video-{job_id[:8]}.mp4")
+    return FileResponse(path, media_type="audio/mpeg", filename=f"audio-track-{job_id[:8]}.mp3")
