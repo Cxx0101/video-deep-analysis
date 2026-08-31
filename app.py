@@ -10,6 +10,7 @@ import sys
 import threading
 import traceback
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -33,6 +34,7 @@ COOKIE_STORE = DATA_DIR / "cookies.txt"
 MODEL_DIR = STORAGE_DIR / "models"
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 MAX_COOKIE_BYTES = 5 * 1024 * 1024
+MAX_EXTRACTED_FRAMES = 5000
 for directory in (UPLOAD_DIR, RESULT_DIR, URL_DOWNLOAD_DIR, COOKIE_DIR, MODEL_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -244,6 +246,101 @@ def separate_audio_video(source_video: Path, video_output: Path, audio_output: P
         video_output.unlink(missing_ok=True)
         audio_output.unlink(missing_ok=True)
         raise
+
+
+def rotate_video_frame(frame: np.ndarray, rotation: int) -> np.ndarray:
+    if rotation == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if rotation == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if rotation == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    return frame
+
+
+def extract_video_frames(
+    source_video: Path, zip_output: Path, preview_output: Path, frame_step: int, progress: dict[str, Any]
+) -> int:
+    """Extract upright JPEG frames into a ZIP without leaving a frame folder behind."""
+    if frame_step < 1:
+        raise ValueError("提取间隔必须至少为 1 帧。")
+    capture = cv2.VideoCapture(str(source_video))
+    if not capture.isOpened():
+        raise ValueError("无法读取该视频。请上传常见的视频格式后重试。")
+    orientation_auto = getattr(cv2, "CAP_PROP_ORIENTATION_AUTO", None)
+    if orientation_auto is not None:
+        capture.set(orientation_auto, 0)
+    rotation = source_rotation_degrees(source_video)
+    if not rotation:
+        orientation_meta = getattr(cv2, "CAP_PROP_ORIENTATION_META", None)
+        if orientation_meta is not None:
+            rotation = int(round(capture.get(orientation_meta))) % 360
+    fps = capture.get(cv2.CAP_PROP_FPS)
+    if not fps or fps < 1 or fps > 240:
+        fps = 30.0
+    frame_count = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+    expected_frames = (frame_count + frame_step - 1) // frame_step
+    if expected_frames > MAX_EXTRACTED_FRAMES:
+        capture.release()
+        raise ValueError(
+            f"预计会导出 {expected_frames} 帧，超过 {MAX_EXTRACTED_FRAMES} 帧安全上限；请增大提取间隔。"
+        )
+    zip_output.unlink(missing_ok=True)
+    preview_output.unlink(missing_ok=True)
+    saved = 0
+    try:
+        with zipfile.ZipFile(zip_output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+            index = 0
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if index % frame_step == 0:
+                    frame = rotate_video_frame(frame, rotation)
+                    encoded_ok, payload = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    if not encoded_ok:
+                        raise RuntimeError("无法编码视频帧为 JPEG。")
+                    timestamp = index / fps
+                    name = f"frame_{index + 1:06d}_{timestamp:09.3f}s.jpg"
+                    data = payload.tobytes()
+                    archive.writestr(name, data)
+                    if saved == 0:
+                        preview_output.write_bytes(data)
+                    saved += 1
+                index += 1
+                progress["progress"] = round(index / frame_count * 100, 1)
+                progress["message"] = f"正在提取视频帧：已保存 {saved} 帧"
+    except Exception:
+        zip_output.unlink(missing_ok=True)
+        preview_output.unlink(missing_ok=True)
+        raise
+    finally:
+        capture.release()
+    if saved == 0:
+        zip_output.unlink(missing_ok=True)
+        preview_output.unlink(missing_ok=True)
+        raise RuntimeError("未从视频中读取到可导出的画面。")
+    return saved
+
+
+def clip_video_segment(source_video: Path, output_path: Path, start_seconds: float, end_seconds: float) -> None:
+    """Precisely re-encode a selected time range as browser-compatible MP4."""
+    if start_seconds < 0 or end_seconds <= start_seconds:
+        raise ValueError("剪辑开始时间必须不小于 0，且结束时间必须晚于开始时间。")
+    duration = end_seconds - start_seconds
+    command = [
+        ffmpeg_executable(), "-y", "-i", str(source_video),
+        "-ss", f"{start_seconds:.3f}", "-t", f"{duration:.3f}",
+        "-map", "0:v:0", "-map", "0:a?",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-map_metadata", "-1",
+        "-metadata:s:v:0", "rotate=0", "-movflags", "+faststart", str(output_path),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if completed.returncode != 0 or not output_path.is_file() or output_path.stat().st_size == 0:
+        output_path.unlink(missing_ok=True)
+        detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "未知 FFmpeg 错误"
+        raise RuntimeError(f"片段剪辑失败：{detail}")
 
 
 class VideoAnalyzer:
@@ -687,15 +784,22 @@ async def create_source_job(
     tool: str = Form(...),
     mode: str | None = Form(None),
     portrait_mode: str | None = Form(None),
+    frame_step: int | None = Form(None),
+    clip_start: float | None = Form(None),
+    clip_end: float | None = Form(None),
 ) -> dict[str, str]:
     """Run a selected tool against an existing uploaded/downloaded source."""
     _source, input_path = get_source_path(source_id)
-    if tool not in {"analysis", "separate", "portrait"}:
+    if tool not in {"analysis", "separate", "portrait", "frames", "clip"}:
         raise HTTPException(400, "未知的视频工具")
     if tool == "analysis" and mode not in MODES:
         raise HTTPException(400, "请选择有效的分析模式")
     if tool == "portrait" and portrait_mode not in PORTRAIT_MODES:
         raise HTTPException(400, "请选择有效的人像与背景分离模式")
+    if tool == "frames" and (frame_step is None or frame_step < 1):
+        raise HTTPException(400, "提取间隔必须至少为 1 帧")
+    if tool == "clip" and (clip_start is None or clip_end is None or clip_start < 0 or clip_end <= clip_start):
+        raise HTTPException(400, "请输入有效的剪辑开始和结束时间")
 
     job_id = uuid.uuid4().hex
     if tool == "analysis":
@@ -714,7 +818,7 @@ async def create_source_job(
             "outputs": {"video": str(video_output), "audio": str(audio_output)},
         }
         background_tasks.add_task(process_source_separation_job, job_id, input_path, video_output, audio_output)
-    else:
+    elif tool == "portrait":
         output_suffix = ".webm" if portrait_mode == "transparent" else ".mp4"
         output_path = RESULT_DIR / f"{job_id}-portrait{output_suffix}"
         jobs[job_id] = {
@@ -722,6 +826,27 @@ async def create_source_job(
             "tool": tool, "portrait_mode": portrait_mode, "source_id": source_id, "output": str(output_path),
         }
         background_tasks.add_task(process_source_portrait_job, job_id, input_path, output_path, str(portrait_mode))
+    elif tool == "frames":
+        zip_output = RESULT_DIR / f"{job_id}-frames.zip"
+        preview_output = RESULT_DIR / f"{job_id}-frame-preview.jpg"
+        jobs[job_id] = {
+            "status": "queued", "progress": 0, "message": "帧提取任务已排队",
+            "tool": tool, "frame_step": frame_step, "source_id": source_id,
+            "output": str(zip_output), "preview_frame": str(preview_output),
+        }
+        background_tasks.add_task(
+            process_source_frames_job, job_id, input_path, zip_output, preview_output, int(frame_step)
+        )
+    else:
+        output_path = RESULT_DIR / f"{job_id}-clip.mp4"
+        jobs[job_id] = {
+            "status": "queued", "progress": 0, "message": "片段剪辑任务已排队",
+            "tool": tool, "clip_start": clip_start, "clip_end": clip_end,
+            "source_id": source_id, "output": str(output_path),
+        }
+        background_tasks.add_task(
+            process_source_clip_job, job_id, input_path, output_path, float(clip_start), float(clip_end)
+        )
     return {"job_id": job_id}
 
 
@@ -763,6 +888,34 @@ def process_source_portrait_job(
     except Exception as exc:
         traceback.print_exc()
         job.update(status="failed", message=f"人像与背景分离失败：{exc}")
+
+
+def process_source_frames_job(
+    job_id: str, input_path: Path, zip_output: Path, preview_output: Path, frame_step: int
+) -> None:
+    job = jobs[job_id]
+    try:
+        with processing_lock:
+            job.update(status="processing", message="正在读取视频帧…")
+            frame_total = extract_video_frames(input_path, zip_output, preview_output, frame_step, job)
+        job.update(status="completed", progress=100, message=f"已提取 {frame_total} 帧，可预览并下载 ZIP。", frame_total=frame_total)
+    except Exception as exc:
+        traceback.print_exc()
+        job.update(status="failed", message=f"帧提取失败：{exc}")
+
+
+def process_source_clip_job(
+    job_id: str, input_path: Path, output_path: Path, start_seconds: float, end_seconds: float
+) -> None:
+    job = jobs[job_id]
+    try:
+        with processing_lock:
+            job.update(status="processing", progress=15, message="正在精确剪辑视频片段…")
+            clip_video_segment(input_path, output_path, start_seconds, end_seconds)
+        job.update(status="completed", progress=100, message="片段剪辑完成，可以预览和下载。")
+    except Exception as exc:
+        traceback.print_exc()
+        job.update(status="failed", message=f"片段剪辑失败：{exc}")
 
 
 @app.post("/api/jobs")
@@ -1052,7 +1205,7 @@ def get_job(job_id: str) -> dict[str, Any]:
         raise HTTPException(404, "任务不存在或服务已重启")
     response = {
         key: value for key, value in job.items()
-        if key not in {"output", "outputs", "source_path", "source_dir", "cookie_path"}
+        if key not in {"output", "outputs", "preview_frame", "source_path", "source_dir", "cookie_path"}
     }
     if job.get("kind") == "download_preview" and job["status"] == "ready":
         response["preview_url"] = f"/api/downloads/{job_id}/preview"
@@ -1064,7 +1217,18 @@ def get_job(job_id: str) -> dict[str, Any]:
             }
         else:
             response["download_url"] = f"/api/jobs/{job_id}/download"
+            if job.get("tool") == "frames" and Path(str(job.get("preview_frame", ""))).is_file():
+                response["preview_url"] = f"/api/jobs/{job_id}/preview-frame"
     return response
+
+
+@app.get("/api/jobs/{job_id}/preview-frame")
+def preview_extracted_frame(job_id: str) -> FileResponse:
+    job = jobs.get(job_id)
+    path = Path(str(job.get("preview_frame", ""))) if job else None
+    if not job or job.get("tool") != "frames" or job.get("status") != "completed" or not path.is_file():
+        raise HTTPException(404, "帧预览不存在")
+    return FileResponse(path, media_type="image/jpeg")
 
 
 @app.get("/api/jobs/{job_id}/download")
@@ -1077,6 +1241,10 @@ def download_job(job_id: str) -> FileResponse:
         raise HTTPException(404, "处理结果文件丢失")
     if path.suffix.lower() == ".webm":
         return FileResponse(path, media_type="video/webm", filename=f"portrait-transparent-{job_id[:8]}.webm")
+    if path.suffix.lower() == ".zip":
+        return FileResponse(path, media_type="application/zip", filename=f"video-frames-{job_id[:8]}.zip")
+    if job.get("tool") == "clip":
+        return FileResponse(path, media_type="video/mp4", filename=f"video-clip-{job_id[:8]}.mp4")
     return FileResponse(path, media_type="video/mp4", filename=f"deep-analysis-{job_id[:8]}.mp4")
 
 

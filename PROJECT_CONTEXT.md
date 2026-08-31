@@ -38,12 +38,16 @@
 - `tool=analysis`，并传入 `mode`：`depth`、`pose`、`depth_pose`、`face`、`all`。
 - `tool=separate`：导出无声 MP4 和 MP3 音频。
 - `tool=portrait`，并传入 `portrait_mode`：`blur`、`white`、`black`、`mask` 或 `transparent`。除 `transparent` 外输出保留原始音频的 MP4；透明模式输出带 Alpha 通道、保留音频的 VP9 WebM。
+- `tool=frames`，并传入 `frame_step`（正整数）：提取 JPEG 帧并导出 ZIP；`1` 表示全部帧，单个任务最多 5000 帧。
+- `tool=clip`，并传入 `clip_start`、`clip_end`（秒）：精确重新编码并导出指定 MP4 片段。
 
 任务进度：`GET /api/jobs/{job_id}`。
 
 - 分析任务完成后返回 `download_url`。
 - 分离任务完成后返回 `downloads.video` 与 `downloads.audio`。
 - 人像与背景分离任务完成后返回 `download_url`。
+- 帧提取任务完成后返回 `download_url`、`preview_url` 与 `frame_total`；`preview_url` 指向首帧 JPEG。
+- 剪辑任务完成后返回 `download_url`。
 
 保留了旧接口（`/api/jobs`、`/api/downloads/{job_id}/process` 等），以维持原有自动化回归测试兼容性；新页面应优先使用 `/api/sources/` 接口。
 
@@ -63,10 +67,13 @@
 - `#analysisNav` ↔ `#analysisPanel`：五种视频智能分析方式。
 - `#separateNav` ↔ `#separatePanel`：音视频分离。
 - `#portraitNav` ↔ `#portraitPanel`：人像与背景分离。
+- `#editingNav` ↔ `#editingPanel`：帧提取与剪辑。
 
 切换统一由 `selectWorkspace()` 处理，必须同时更新菜单和工作区的 `active` 类，避免出现多个菜单同时高亮或不匹配的工作区。
 
 “导入视频”和“源视频预览”是两个工作区共用区域。预览标题旁的“已选择”标签应保持紧凑，不要放到卡片最右侧。
+
+剪辑工作区保留隐藏的原生双滑块 `#clipStartRange`、`#clipEndRange` 与秒数输入 `#clipStart`、`#clipEnd` 作为状态源；简洁可视时间轨 `.capcut-timeline` 会通过 `.capcut-filmstrip` 自动生成素材缩略图，左右手柄和中间白色选区必须与状态源双向同步。拖动左右手柄调整边界，拖动 `.capcut-selection` 移动整段选区，点击轨道调整最近的边界；高亮区域始终表示实际将导出的时间范围。
 
 ## 验证建议
 
@@ -82,10 +89,13 @@
 1. 本地上传 → 预览 → 音视频分离 → 下载 MP4 和 MP3。
 2. 使用同一个 `source_id` 再提交一次分析任务，无需再次上传。
 3. 使用同一个 `source_id` 运行人像与背景分离，至少验证背景虚化和人像蒙版可解码。
-4. 左侧三个菜单互斥高亮，且只显示对应工作区。
-5. 服务保持在 8000 端口可访问：`GET /api/health`。
+4. 使用同一个 `source_id` 提取帧并下载 ZIP，确认 ZIP 内帧数和首帧预览；再验证指定开始/结束秒数的剪辑 MP4。
+5. 左侧四个菜单互斥高亮，且只显示对应工作区。
+6. 服务保持在 8000 端口可访问：`GET /api/health`。
 
 ## 运行和清理注意事项
+
+`run_web.py` 默认使用 8000；若端口被遗留服务占用，会从 8001–8010 选择空闲端口并自动打开浏览器。不要假设所有运行实例都在 8000。
 
 - Windows 从项目目录用 `.venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8000` 启动服务；启动脚本是用户优先使用的入口。
 - macOS 使用 Python 3.11；不要将依赖升级为只支持 Python 3.12+ 的版本。
