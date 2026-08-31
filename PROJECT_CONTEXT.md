@@ -73,7 +73,7 @@
 
 “导入视频”和“源视频预览”是两个工作区共用区域。预览标题旁的“已选择”标签应保持紧凑，不要放到卡片最右侧。
 
-剪辑工作区保留隐藏的原生双滑块 `#clipStartRange`、`#clipEndRange` 与秒数输入 `#clipStart`、`#clipEnd` 作为状态源；简洁可视时间轨 `.capcut-timeline` 会通过 `.capcut-filmstrip` 自动生成素材缩略图，左右手柄和中间白色选区必须与状态源双向同步。拖动左右手柄调整边界，拖动 `.capcut-selection` 移动整段选区，点击轨道调整最近的边界；高亮区域始终表示实际将导出的时间范围。
+剪辑工作区的提取区和剪辑区必须上下排列。保留隐藏的原生双滑块 `#clipStartRange`、`#clipEndRange` 与秒数输入 `#clipStart`、`#clipEnd` 作为状态源；简洁可视时间轨 `.capcut-timeline` 会通过 `.capcut-filmstrip` 自动生成素材缩略图。缩略图以 `0.01` 秒（10ms）为时间采样精度，但 `capcutThumbnailRenderLimit` 会压缩长视频的可视代表图数量，以避免浏览器一次加载数千张图片。左右手柄和中间白色选区必须与状态源双向同步。拖动左右手柄调整边界，拖动 `.capcut-selection` 移动整段选区，点击轨道调整最近的边界；高亮区域始终表示实际将导出的时间范围。
 
 ## 验证建议
 
