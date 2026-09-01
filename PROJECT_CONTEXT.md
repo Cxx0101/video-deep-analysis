@@ -36,7 +36,7 @@
 `POST /api/sources/{source_id}/jobs` 的表单参数：
 
 - `tool=analysis`，并传入 `mode`：`depth`、`pose`、`depth_pose`、`face`、`all`。
-- `tool=separate`：导出无声 MP4 和 MP3 音频。
+- `tool=separate`：导出无声 MP4 和 MP3 音频；可选 `audio_clip_start`、`audio_clip_end`（秒）仅裁剪导出的 MP3，二者必须同时提供且结束时间大于开始时间。
 - `tool=portrait`，并传入 `portrait_mode`：`blur`、`white`、`black`、`mask` 或 `transparent`。除 `transparent` 外输出保留原始音频的 MP4；透明模式输出带 Alpha 通道、保留音频的 VP9 WebM。
 - `tool=frames`，并传入 `frame_step`（正整数）：提取 JPEG 帧并导出 ZIP；`1` 表示全部帧，单个任务最多 5000 帧。
 - `tool=clip`，并传入 `clip_start`、`clip_end`（秒）：精确重新编码并导出指定 MP4 片段。
@@ -44,7 +44,7 @@
 任务进度：`GET /api/jobs/{job_id}`。
 
 - 分析任务完成后返回 `download_url`。
-- 分离任务完成后返回 `downloads.video` 与 `downloads.audio`。
+- 分离任务完成后返回 `downloads.video` 与 `downloads.audio`；前端 `#audioClipStart`、`#audioClipEnd` 与当前素材时长联动，默认导出完整音频。
 - 人像与背景分离任务完成后返回 `download_url`。
 - 帧提取任务完成后返回 `download_url`、`preview_url` 与 `frame_total`；`preview_url` 指向首帧 JPEG。
 - 剪辑任务完成后返回 `download_url`。

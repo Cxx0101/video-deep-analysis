@@ -212,8 +212,14 @@ def source_rotation_filter(video_path: Path) -> str | None:
     return None
 
 
-def separate_audio_video(source_video: Path, video_output: Path, audio_output: Path) -> None:
-    """Export a browser-ready silent MP4 and the source's first audio track."""
+def separate_audio_video(
+    source_video: Path,
+    video_output: Path,
+    audio_output: Path,
+    audio_start: float | None = None,
+    audio_end: float | None = None,
+) -> None:
+    """Export a browser-ready silent MP4 and an optional audio-only time range."""
     video_command = [
         ffmpeg_executable(), "-y", "-noautorotate", "-i", str(source_video),
         "-map", "0:v:0", "-an",
@@ -226,10 +232,10 @@ def separate_audio_video(source_video: Path, video_output: Path, audio_output: P
         "-pix_fmt", "yuv420p", "-map_metadata", "-1",
         "-metadata:s:v:0", "rotate=0", "-movflags", "+faststart", str(video_output),
     ])
-    audio_command = [
-        ffmpeg_executable(), "-y", "-i", str(source_video),
-        "-map", "0:a:0", "-vn", "-c:a", "libmp3lame", "-q:a", "2", str(audio_output),
-    ]
+    audio_command = [ffmpeg_executable(), "-y", "-i", str(source_video)]
+    if audio_start is not None and audio_end is not None:
+        audio_command.extend(["-ss", f"{audio_start:.3f}", "-t", f"{audio_end - audio_start:.3f}"])
+    audio_command.extend(["-map", "0:a:0", "-vn", "-c:a", "libmp3lame", "-q:a", "2", str(audio_output)])
     try:
         for command, label in ((video_command, "无声视频"), (audio_command, "音频")):
             completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -787,6 +793,8 @@ async def create_source_job(
     frame_step: int | None = Form(None),
     clip_start: float | None = Form(None),
     clip_end: float | None = Form(None),
+    audio_clip_start: float | None = Form(None),
+    audio_clip_end: float | None = Form(None),
 ) -> dict[str, str]:
     """Run a selected tool against an existing uploaded/downloaded source."""
     _source, input_path = get_source_path(source_id)
@@ -800,6 +808,11 @@ async def create_source_job(
         raise HTTPException(400, "提取间隔必须至少为 1 帧")
     if tool == "clip" and (clip_start is None or clip_end is None or clip_start < 0 or clip_end <= clip_start):
         raise HTTPException(400, "请输入有效的剪辑开始和结束时间")
+    if tool == "separate" and (
+        (audio_clip_start is None) != (audio_clip_end is None)
+        or (audio_clip_start is not None and (audio_clip_start < 0 or audio_clip_end is None or audio_clip_end <= audio_clip_start))
+    ):
+        raise HTTPException(400, "请输入有效的音频裁剪开始和结束时间")
 
     job_id = uuid.uuid4().hex
     if tool == "analysis":
@@ -815,9 +828,18 @@ async def create_source_job(
         jobs[job_id] = {
             "status": "queued", "progress": 0, "message": "音视频分离任务已排队",
             "tool": tool, "source_id": source_id,
+            "audio_clip_start": audio_clip_start, "audio_clip_end": audio_clip_end,
             "outputs": {"video": str(video_output), "audio": str(audio_output)},
         }
-        background_tasks.add_task(process_source_separation_job, job_id, input_path, video_output, audio_output)
+        background_tasks.add_task(
+            process_source_separation_job,
+            job_id,
+            input_path,
+            video_output,
+            audio_output,
+            audio_clip_start,
+            audio_clip_end,
+        )
     elif tool == "portrait":
         output_suffix = ".webm" if portrait_mode == "transparent" else ".mp4"
         output_path = RESULT_DIR / f"{job_id}-portrait{output_suffix}"
@@ -863,14 +885,21 @@ def process_source_analysis_job(job_id: str, input_path: Path, output_path: Path
 
 
 def process_source_separation_job(
-    job_id: str, input_path: Path, video_output: Path, audio_output: Path
+    job_id: str,
+    input_path: Path,
+    video_output: Path,
+    audio_output: Path,
+    audio_clip_start: float | None = None,
+    audio_clip_end: float | None = None,
 ) -> None:
     job = jobs[job_id]
     try:
         with processing_lock:
-            job.update(status="processing", progress=10, message="正在导出无声视频…")
-            separate_audio_video(input_path, video_output, audio_output)
-        job.update(status="completed", progress=100, message="音频和无声视频已分离，可以预览和下载。")
+            message = "正在导出无声视频与裁剪音频…" if audio_clip_start is not None else "正在导出无声视频…"
+            job.update(status="processing", progress=10, message=message)
+            separate_audio_video(input_path, video_output, audio_output, audio_clip_start, audio_clip_end)
+        message = "音频区间和无声视频已导出，可以预览和下载。" if audio_clip_start is not None else "音频和无声视频已分离，可以预览和下载。"
+        job.update(status="completed", progress=100, message=message)
     except Exception as exc:
         traceback.print_exc()
         job.update(status="failed", message=f"音视频分离失败：{exc}")
